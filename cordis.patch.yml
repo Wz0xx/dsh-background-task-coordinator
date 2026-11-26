@@ -1,0 +1,4 @@
+- insert:
+    - id: background-task-coordinator
+      name: dsh-background-task-coordinator
+      config: {}
