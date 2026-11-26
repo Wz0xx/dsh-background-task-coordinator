@@ -1,0 +1,13 @@
+node_modules/
+*.bak-*
+*.bak
+tasks.db
+tasks.db-shm
+tasks.db-wal
+tasks.json
+tasks.json.migrated
+*.log
+dist/
+*.tgz
+*.zip
+.DS_Store
