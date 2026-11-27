@@ -2123,6 +2123,349 @@ const rm = (p) => { try { fs.rmSync(p, { recursive: true, force: true, maxRetrie
   if (saved.H !== undefined) process.env.DSH_HOME = saved.H; else delete process.env.DSH_HOME;
 }
 
+// ---------------------------------------------------------------------------
+// 24. 0.2.6 修复：任务摘要落库必须脱敏（job detail 里可能带密钥）
+//     这条是实测发现的：同一个 detail，emitEvent 脱敏了，updateTaskFields 没脱敏
+// ---------------------------------------------------------------------------
+{
+  const lkHome = fs.mkdtempSync(path.join(os.tmpdir(), 'v026-leak-'));
+  const saved = { U: process.env.USERPROFILE, H: process.env.HOME, D: process.env.DSH_PROFILE_DIR, P: process.env.DSH_PROFILE, Hm: process.env.DSH_HOME };
+  process.env.USERPROFILE = lkHome; process.env.HOME = lkHome;
+  delete process.env.DSH_PROFILE_DIR; delete process.env.DSH_PROFILE; delete process.env.DSH_HOME;
+
+  const SECRET = 'sk-ant-LOOPCHECK777';
+  const R = {}, logs = [];
+  const ctx = mkCtx({
+    logger: { info: (m) => logs.push(m) },
+    jobs: {
+      start() { return 'nj-leak'; },
+      get() { return { status: 'running' }; },
+      readAt() { return { chunks: [] }; },
+      kill() { return 'requested'; },
+      events: {
+        subscribe(_opt, fn) {
+          // settled 的 detail 就是命令输出摘要，塞个密钥进去
+          setTimeout(() => fn({
+            type: 'settled',
+            job: { id: 'nj-leak', status: 'completed', detail: `stdout: TOKEN=${SECRET}` },
+          }), 10);
+          return () => {};
+        },
+      },
+    },
+    agents: { get() { return undefined; } },
+    workingDirectory: { ensure: async () => process.cwd() },
+    sandboxPolicy: { resolve: async () => ({ mode: 'danger-full-access' }) },
+    sandbox: { confine: async (a) => ({ argv: a }) },
+    tools: { register(t) { R[t.name] = t; } },
+    on() { return () => {}; },
+  });
+
+  const modLk = await import(`${ROOT}/index.js?leak=${Date.now()}`);
+  modLk.default.apply(ctx, { profile: 'lk', global: 20, perOwner: 20, timeoutMinutes: 120, sweepSeconds: 600, retentionDays: 30 });
+  const ex = { agent: { id: 'o-lk', session: { id: 'o-lk' } } };
+  const rr = await R.task_create.execute({ type: 'job', title: 't', objective: 'echo hi' }, ex);
+  const tid = rr.text.match(/taskId=([\w-]+)/)?.[1];
+  await new Promise((res) => setTimeout(res, 150));
+
+  const dirLog = logs.find((l) => l.includes('台账目录：')) ?? '';
+  const dm = dirLog.match(/台账目录：(.+?)（来源/);
+  const dbp = dm ? path.join(dm[1], 'tasks.db') : null;
+  const ro = new DatabaseSync(dbp, { readOnly: true });
+  const row = ro.prepare('SELECT result_summary, error_summary FROM tasks WHERE id=?').get(tid);
+  ro.close();
+  const summary = `${row?.result_summary ?? ''}${row?.error_summary ?? ''}`;
+
+  ok('24.1 任务摘要里的密钥已脱敏（result_summary）', !summary.includes(SECRET),
+    JSON.stringify(String(row?.result_summary ?? '').slice(0, 60)));
+  ok('24.2 事件流水同样脱敏', (() => {
+    const ro2 = new DatabaseSync(dbp, { readOnly: true });
+    const evs = ro2.prepare('SELECT payload FROM task_events WHERE task_id=?').all(tid);
+    ro2.close();
+    return !evs.some((e) => String(e.payload ?? '').includes(SECRET));
+  })());
+
+  if (saved.U !== undefined) process.env.USERPROFILE = saved.U;
+  if (saved.H !== undefined) process.env.HOME = saved.H;
+  if (saved.D !== undefined) process.env.DSH_PROFILE_DIR = saved.D;
+  if (saved.P !== undefined) process.env.DSH_PROFILE = saved.P;
+  if (saved.Hm !== undefined) process.env.DSH_HOME = saved.Hm;
+  try { fs.rmSync(lkHome, { recursive: true, force: true, maxRetries: 3 }); } catch {}
+}
+
+// ---------------------------------------------------------------------------
+// 25. 0.2.6 根因修复：ctx.get 的 strict 语义
+//     服务 fiber 未 ACTIVE 时，strict 查询拿不到 —— 这不是「服务不存在」，
+//     而 0.2.0–0.2.5 一直把它当成了不存在（working_directory 恒 unsupported）
+// ---------------------------------------------------------------------------
+{
+  const { notActive } = await import('./mockctx.mjs');
+
+  // 25.1 mock 本身要复刻宿主语义（否则这个 bug 在测试里永远看不见）
+  {
+    const ctx = mkCtx({ workingDirectory: notActive({ ensure() {} }) });
+    ok('25.1 mock 复刻 strict 语义（未 ACTIVE 时 strict 拿不到）',
+      ctx.get('workingDirectory') === undefined && !!ctx.get('workingDirectory', false));
+  }
+
+  // 25.2 自检必须在「三个服务都未 ACTIVE」时报 supported
+  {
+    const homeW = fs.mkdtempSync(path.join(os.tmpdir(), 'v026-strict-'));
+    const logs = [];
+    const ctx = mkCtx({
+      logger: { info: (m) => logs.push(m) },
+      jobs: { start() { return 'nj'; }, get() { return { status: 'running' }; }, readAt() { return { chunks: [] }; }, kill() { return 'requested'; }, events: { subscribe() { return () => {}; } } },
+      agents: { get() { return undefined; } },
+      // 关键：三个服务都是「存在但 fiber 未 ACTIVE」—— 正是本机的真实形态
+      workingDirectory: notActive({ ensure: async () => process.cwd() }),
+      sandboxPolicy: notActive({ resolve: async () => ({ mode: 'danger-full-access' }) }),
+      sandbox: notActive({ confine: async (a) => ({ argv: a }) }),
+      subagents: notActive({ listChildren: async () => [], listDescendants: async () => [] }),
+      tools: { register() {} }, on() { return () => {}; },
+    });
+    const modS = await import(`${ROOT}/index.js?strict=${Date.now()}`);
+    const dispose = modS.default.apply(ctx, { profile: 'strictchk', global: 20, perOwner: 20, timeoutMinutes: 120, sweepSeconds: 600, retentionDays: 30 });
+    const compatLine = logs.find((l) => l.includes('compat: ')) ?? '';
+    const cap = compatLine ? JSON.parse(compatLine.slice(compatLine.indexOf('compat: ') + 8)) : null;
+
+    ok('25.2 服务存在但未 ACTIVE 时，working_directory 仍报 supported',
+      cap?.caps?.working_directory === 'supported', cap?.caps?.working_directory);
+    ok('25.3 sandbox.confine / policy 同样 supported',
+      cap?.caps?.['sandbox.confine'] === 'supported' && cap?.caps?.['sandbox.policy'] === 'supported',
+      `${cap?.caps?.['sandbox.confine']} / ${cap?.caps?.['sandbox.policy']}`);
+    ok('25.4 overallStatus 不再是 incompatible（这三个是必需/常用的）',
+      cap?.overallStatus !== 'incompatible', cap?.overallStatus);
+
+    // 25.5 实际建 job 时也要能拿到 cwd（不是只自检好看）
+    const R2 = {};
+    const ctx2 = mkCtx({
+      logger: { info: () => {} },
+      jobs: { start() { return 'nj'; }, get() { return { status: 'running' }; }, readAt() { return { chunks: [] }; }, kill() { return 'requested'; }, events: { subscribe() { return () => {}; } } },
+      agents: { get() { return undefined; } },
+      workingDirectory: notActive({ ensure: async () => process.cwd() }),
+      sandboxPolicy: notActive({ resolve: async () => ({ mode: 'danger-full-access' }) }),
+      sandbox: notActive({ confine: async (a) => ({ argv: a }) }),
+      tools: { register(t) { R2[t.name] = t; } }, on() { return () => {}; },
+    });
+    const modT = await import(`${ROOT}/index.js?strict2=${Date.now()}`);
+    modT.default.apply(ctx2, { profile: 'strictchk2', global: 20, perOwner: 20, timeoutMinutes: 120, sweepSeconds: 600, retentionDays: 30 });
+    const r = await R2.task_create.execute({ type: 'job', title: 's', objective: 'echo hi' },
+      { agent: { id: 's-str', session: { id: 's-str' } } });
+    ok('25.5 建 job 时不因 strict 而落 cwdFallback', r.ok, r.text.split('\n')[0].slice(0, 40));
+
+    if (typeof dispose === 'function') dispose();
+    try { fs.rmSync(homeW, { recursive: true, force: true, maxRetries: 3 }); } catch {}
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 26. 子代理绑定的共享语义（不是 bug，是要说清的边界）
+//     同会话多个任务可以指向同一个子代理（共享 = 合理需求）
+//     跨会话不行（归属校验先拦）
+// ---------------------------------------------------------------------------
+{
+  const dupHome = fs.mkdtempSync(path.join(os.tmpdir(), 'v026-dup-'));
+  const saved = { U: process.env.USERPROFILE, H: process.env.HOME, D: process.env.DSH_PROFILE_DIR, P: process.env.DSH_PROFILE, Hm: process.env.DSH_HOME };
+  process.env.USERPROFILE = dupHome; process.env.HOME = dupHome;
+  delete process.env.DSH_PROFILE_DIR; delete process.env.DSH_PROFILE; delete process.env.DSH_HOME;
+
+  const R = {}, inbox = [];
+  const alive = new Set(['sess-DUP']);
+  const tree = { 'owner-A': [{ id: 'sess-DUP', label: 'worker', createdAt: 1 }], 'owner-B': [] };
+  const ctx = mkCtx({
+    logger: { info: () => {} },
+    jobs: { start() { return 'nj'; }, get() { return { status: 'running' }; }, readAt() { return { chunks: [] }; }, kill() { return 'requested'; }, events: { subscribe() { return () => {}; } } },
+    agents: { get(id) { return alive.has(id) ? { status: {}, followup(m) { inbox.push({ id, t: m.content?.[0]?.text }); }, steer() {}, cancel() {} } : undefined; } },
+    workingDirectory: { ensure: async () => process.cwd() },
+    sandboxPolicy: { resolve: async () => ({ mode: 'danger-full-access' }) },
+    sandbox: { confine: async (a) => ({ argv: a }) },
+    subagents: { listChildren: async (p) => tree[p] ?? [], listDescendants: async (p) => tree[p] ?? [] },
+    tools: { register(t) { R[t.name] = t; } }, on() { return () => {}; },
+  });
+  const modD = await import(`${ROOT}/index.js?dup=${Date.now()}`);
+  modD.default.apply(ctx, { profile: 'dup', global: 20, perOwner: 20, timeoutMinutes: 120, sweepSeconds: 600, retentionDays: 30 });
+
+  const A = { agent: { id: 'owner-A', session: { id: 'owner-A' } } };
+  const B = { agent: { id: 'owner-B', session: { id: 'owner-B' } } };
+
+  const mkTask = async (title, who) => {
+    const rr = await R.task_create.execute({ type: 'subagent', title, objective: 'x' }, who);
+    return rr.text.match(/taskId=([\w-]+)/)?.[1];
+  };
+
+  const t1 = await mkTask('task1', A);
+  const r1 = await R.task_register_delegation.execute({ taskId: t1, agentId: 'worker', sessionId: 'sess-DUP' }, A);
+  ok('26.1 同会话第一个任务绑定成功', r1.ok, r1.text.slice(0, 40));
+
+  const t2 = await mkTask('task2', A);
+  const r2 = await R.task_register_delegation.execute({ taskId: t2, agentId: 'worker', sessionId: 'sess-DUP' }, A);
+  ok('26.2 同会话第二个任务可绑同一子代理（共享是允许的）', r2.ok, r2.text.slice(0, 50));
+
+  const t3 = await mkTask('task3', B);
+  const r3 = await R.task_register_delegation.execute({ taskId: t3, agentId: 'worker', sessionId: 'sess-DUP' }, B);
+  ok('26.3 跨会话绑同一子代理被拒', !r3.ok, r3.text.slice(0, 60));
+
+  // 消息只投给那个子代理一次，不是广播到两个任务
+  inbox.length = 0;
+  await R.task_append_message.execute({ taskId: t1, content: 'only-once' }, A);
+  ok('26.4 追加消息只投一次（不因共享而重复投递）',
+    inbox.filter((m) => String(m.t).includes('only-once')).length === 1,
+    JSON.stringify(inbox));
+
+  if (saved.U !== undefined) process.env.USERPROFILE = saved.U;
+  if (saved.H !== undefined) process.env.HOME = saved.H;
+  if (saved.D !== undefined) process.env.DSH_PROFILE_DIR = saved.D;
+  if (saved.P !== undefined) process.env.DSH_PROFILE = saved.P;
+  if (saved.Hm !== undefined) process.env.DSH_HOME = saved.Hm;
+  try { fs.rmSync(dupHome, { recursive: true, force: true, maxRetries: 3 }); } catch {}
+}
+
+// ---------------------------------------------------------------------------
+// 27. 0.2.6：无 subagents 枚举服务时的最低门槛
+//     只拦「拿别人的 id 按自己名下」，其余（未登记 / 查不到）一律放行
+// ---------------------------------------------------------------------------
+{
+  const { resolveSubagentBinding } = await import(`${ROOT}/compat/subagents-adapter.js`);
+
+  // 场景 A：宿主无 subagents 枚举，agents 知道这个 sid 属于别的 agent 名 → 拒绝
+  {
+    const ctx = mkCtx({
+      agents: { get: (id) => (id === 'sess-OTHER' ? { name: 'someoneElse' } : undefined) },
+      // 故意不提供 subagents 的 listChildren/listDescendants/resolveName
+      subagents: {},
+    });
+    const r = await resolveSubagentBinding(ctx, 'myWorker', { session: { id: 'parent-1' }, id: 'parent-1' }, 'sess-OTHER');
+    ok('27.1 名字不符时拒绝（把别人的 id 按到自己名下）', r.rejected === true, r.reason);
+  }
+
+  // 场景 B：agents 根本查不到（未登记，正常时序）→ 放行
+  {
+    const ctx = mkCtx({ agents: { get: () => undefined }, subagents: {} });
+    const r = await resolveSubagentBinding(ctx, 'myWorker', { session: { id: 'parent-1' }, id: 'parent-1' }, 'sess-NEW');
+    ok('27.2 未登记的 id 不误拒（正常时序）', r.rejected === false && r.sid === 'sess-NEW', JSON.stringify(r));
+  }
+
+  // 场景 C：连 agents 服务都没有 → 放行（这个宿主什么都证明不了）
+  {
+    const ctx = mkCtx({ subagents: {} });
+    const r = await resolveSubagentBinding(ctx, 'myWorker', { session: { id: 'parent-1' }, id: 'parent-1' }, 'sess-X');
+    ok('27.3 无 agents 服务时不误拒', r.rejected === false, JSON.stringify(r));
+  }
+
+  // 场景 D：名字对得上 → 放行且标记未核实（verified 只表示「已核验」，不是「必须核验」）
+  {
+    const ctx = mkCtx({
+      agents: { get: (id) => (id === 'sess-MINE' ? { name: 'myWorker' } : undefined) },
+      subagents: {},
+    });
+    const r = await resolveSubagentBinding(ctx, 'myWorker', { session: { id: 'parent-1' }, id: 'parent-1' }, 'sess-MINE');
+    ok('27.4 名字对得上时放行', r.rejected === false && r.sid === 'sess-MINE', JSON.stringify(r));
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 28. 脱敏的边界（0.2.6）：它是模式匹配，不是保险。
+//     抓住什么、抓不住什么，都写成断言 —— 免得把「已脱敏」当成安全保证。
+// ---------------------------------------------------------------------------
+{
+  const srcR = fs.readFileSync(new URL('../index.js', import.meta.url), 'utf8');
+  const r0 = srcR.indexOf('function redactSecrets(input) {');
+  const r1 = srcR.indexOf('\n}', r0) + 2;
+  const redact = new Function(srcR.slice(r0, r1) + '; return redactSecrets;')();
+
+  // 28.1 常见凭据格式必须抓住
+  const catchCases = [
+    ['Bearer sk- 风格', 'curl -H "Authorization: Bearer sk-ant-abcdef1234567890"'],
+    ['GitHub PAT', 'git clone https://ghp_abcdefghijklmnopqrstuvwxyz123456@github.com/x'],
+    ['AWS AKIA', 'export AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE'],
+    ['Slack xoxb', 'curl -H "xoxb-1234567890-abcdefghij"'],
+    ['Google AIza', '?key=AIzaSyDdI0hCZtE6vySjMm-WEfRq3CPzqKqqsHI'],
+    ['env 赋值', 'DEEPSEEK_API_KEY=sk-1234567890abcdef'],
+    ['URL 密码', 'psql postgres://admin:SuperSecret123@db.host/x'],
+    ['--token flag', 'mytool --token abcdef1234567890'],
+  ];
+  let caught = 0;
+  for (const [, input] of catchCases) if (redact(input).includes('[REDACTED]')) caught += 1;
+  ok('28.1 常见凭据格式全部抓住', caught === catchCases.length, `${caught}/${catchCases.length}`);
+
+  // 28.2 普通命令零误伤（这条更重要：误伤会让指令没法执行）
+  const safeCases = ['npm run build', 'git status', 'ls -la', 'node app.js --port 3000', 'docker build -t x:1 .'];
+  const untouched = safeCases.filter((c) => redact(c) === c);
+  ok('28.2 普通命令不被误伤', untouched.length === safeCases.length, `${untouched.length}/${safeCases.length}`);
+
+  // 28.3 认不出的（固有边界）：把它断言成事实，而不是假装没有
+  //      这些**不应该**被当成安全漏洞去修 —— 修不了，正则没有语义理解。
+  const missCases = [
+    'MY_PRIVATE_BLOB=deadbeefcafe1234',       // 自定义字段名 + 纯十六进制
+    'data=QWxhZGRpbjpvcGVuIHNlc2FtZQ==',      // 纯 base64
+    '数据库口令是 海淀区123456',               // 中文语境
+    'key=aa11-bb22-cc33-dd44',                // 短分段
+    'password=abc123',                        // 短密码
+  ];
+  const missed = missCases.filter((c) => redact(c) === c);
+  ok('28.3 自定义/短格式确实认不出（已知边界，不是回归）',
+    missed.length === missCases.length, `${missed.length}/${missCases.length} 未处理`);
+
+  // 28.4 所以：脱敏只是「减少泄露面」，不是「保证不泄露」
+  //      这条断言的意义是让这个事实留在测试里，而不是只在文档里
+  ok('28.4 明确记录：脱敏不等于安全边界（认不出 base64/中文/短密码）',
+    redact('data=QWxhZGRpbjpvcGVuIHNlc2FtZQ==') === 'data=QWxhZGRpbjpvcGVuIHNlc2FtZQ==');
+}
+
+// ---------------------------------------------------------------------------
+// 29. 元数据正向确权路径（0.2.6）：本机 listChildren 可用，走不到这条；
+//     用构造场景把它测出来，并把 fail-closed 的取舍写进断言
+// ---------------------------------------------------------------------------
+{
+  const { resolveSubagentBinding } = await import(`${ROOT}/compat/subagents-adapter.js`);
+  const callerA = { session: { id: 'parent-A' }, id: 'parent-A' };
+
+  // 29.1 子代理已结束（从 listChildren 移出），但 agents 带父会话字段且对得上 → 放行
+  {
+    const ctx = mkCtx({
+      agents: { get: (id) => (id === 'sess-DONE' ? { parentSessionId: 'parent-A', status: 'idle' } : undefined) },
+      subagents: { listChildren: async () => [], listDescendants: async () => [] },
+    });
+    const r = await resolveSubagentBinding(ctx, 'worker', callerA, 'sess-DONE');
+    ok('29.1 元数据正向确权：已移出列表但父会话对得上 → 放行',
+      r.rejected === false && r.sid === 'sess-DONE', JSON.stringify(r));
+  }
+
+  // 29.2 元数据说父会话是别人 → 必须拒
+  {
+    const ctx = mkCtx({
+      agents: { get: (id) => (id === 'sess-OTHER' ? { parentSessionId: 'parent-B' } : undefined) },
+      subagents: { listChildren: async () => [], listDescendants: async () => [] },
+    });
+    const r = await resolveSubagentBinding(ctx, 'worker', callerA, 'sess-OTHER');
+    ok('29.2 元数据说父会话是别人 → 拒绝',
+      r.rejected === true && /不一致/.test(String(r.reason)), r.reason);
+  }
+
+  // 29.3 元数据空 + 列表空 → fail-closed 拒绝
+  //      这是有意的保守取舍：什么都证明不了时宁可不绑，也不冒越权的险。
+  //      代价是这种宿主上的正常绑定会被拒 —— 需要靠 metadata 或台账唯一性补。
+  {
+    const ctx = mkCtx({
+      agents: { get: () => undefined },
+      subagents: { listChildren: async () => [], listDescendants: async () => [] },
+    });
+    const r = await resolveSubagentBinding(ctx, 'worker', callerA, 'sess-UNKNOWN');
+    ok('29.3 什么都证明不了 → fail-closed（保守取舍，已知会误伤）',
+      r.rejected === true, r.reason);
+  }
+
+  // 29.4 正常路径：子代理在列表里
+  {
+    const ctx = mkCtx({
+      agents: { get: () => undefined },
+      subagents: { listChildren: async (p) => (p === 'parent-A' ? [{ id: 'sess-LIVE', label: 'worker', createdAt: 1 }] : []) },
+    });
+    const r = await resolveSubagentBinding(ctx, 'worker', callerA, 'sess-LIVE');
+    ok('29.4 正常路径（在列表里）放行', r.rejected === false && r.sid === 'sess-LIVE', JSON.stringify(r));
+  }
+}
+
 console.log('=== 0.2.0 专项 ===');
 console.log(P.join('\n'));
 const pass = P.filter((x) => x.startsWith('✅')).length;

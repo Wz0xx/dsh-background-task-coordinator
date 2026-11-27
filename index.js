@@ -284,6 +284,8 @@ import { CoordinatorDatabase } from './lib/storage/database.js';
 
 let _sqlite = null; // CoordinatorDatabase 单例
 let ACTIVE_DB_PATH = null; // 0.2.4：apply() 时锁定本次实例的库路径，防止运行期 env 变动导致中途切库
+// 0.2.6：把 apply 收到的 config 记一份，db() 建库时要读权限选项（模块级函数拿不到闭包）
+let _pluginCfgRef = null;
 // 模块级日志钩子：apply() 时注入，供 migrate 等模块级函数使用
 let _log = () => {};
 // 模块级 ctx 引用：settleNotification 这类模块级函数要给发起会话投消息，
@@ -292,7 +294,11 @@ let ACTIVE_CTX = null;
 
 function db() {
   if (!_sqlite) {
-    _sqlite = new CoordinatorDatabase(ACTIVE_DB_PATH || dbPath());
+    // 0.2.6：把 config 里的权限选项透传下去。
+    // Windows 默认不收窄 ACL（会影响其他身份运行的工具），要就显式开。
+    _sqlite = new CoordinatorDatabase(ACTIVE_DB_PATH || dbPath(), {
+      tightenWindowsAcl: _pluginCfgRef?.tightenWindowsAcl === true,
+    });
     migrateJsonFileIfNeeded();
   }
   return _sqlite;
@@ -620,6 +626,7 @@ export function apply(ctx, config) {
   _log = log; // 模块级函数（migrate 等）也要能打日志
   ACTIVE_CTX = ctx;   // settleNotification 要给发起会话投消息，需要 agents 服务
   ACTIVE_PROFILE_HINT = PLUGIN_CFG; // 0.2.4：让 dataDir()/db() 优先读 config.profile / config.profileName
+  _pluginCfgRef = PLUGIN_CFG;       // 0.2.6：db() 建库时读权限选项
   const dirInfo = resolveDataDir(PLUGIN_CFG);
   const nextDbPath = path.join(dirInfo.dir, 'tasks.db');
   if (_sqlite && _sqlite.path !== nextDbPath) {
@@ -887,8 +894,12 @@ export function apply(ctx, config) {
       d.updateTaskFields(t.id, {
         status: terminal,
         currentStage: 'settled',
-        resultSummary: terminal === 'succeeded' ? String(view.detail ?? '作业正常结束').slice(0, 300) : undefined,
-        errorSummary: terminal !== 'succeeded' ? String(view.detail ?? terminal).slice(0, 300) : undefined,
+        // 0.2.6 补：任务摘要也会落库，必须脱敏。
+        // 对比 emitEvent 那条路径 —— 它对同一个 detail 做了 redactSecrets，
+        // 这里却写了原文（实测：result_summary 里出现 "output: TOKEN=sk-ant-..."）。
+        // 同一个值两条路径处理不一致，等于留了个后门。
+        resultSummary: terminal === 'succeeded' ? redactSecrets(String(view.detail ?? '作业正常结束')).slice(0, 300) : undefined,
+        errorSummary: terminal !== 'succeeded' ? redactSecrets(String(view.detail ?? terminal)).slice(0, 300) : undefined,
         updatedAt: Date.now(),
         completedAt: Date.now(),
       });
@@ -1026,9 +1037,17 @@ export function apply(ctx, config) {
             };
           }
           // 可选服务查询：取不到返回 undefined，不抛。
+          //
+          // 0.2.6：传 strict=false。宿主 ctx.get(name) 默认 strict=true，
+          // 只返回 **fiber 处于 ACTIVE(2)** 的服务；workingDirectory / sandbox /
+          // sandboxPolicy 是本插件没 inject 的，加载时序上 fiber 可能还没 ACTIVE，
+          // 于是 strict 查询拿到 undefined —— 服务明明在，却当成了没有。
+          // 这不影响 inject 过的服务（它们本来就 ACTIVE），所以只在这里放宽。
           const svc = (name) => {
             try {
-              return typeof ctx.get === 'function' ? ctx.get(name) : undefined;
+              if (typeof ctx.get !== 'function') return undefined;
+              // 先不严格（能拿到实例就行），拿不到再退回严格查询
+              return ctx.get(name, false) ?? ctx.get(name);
             } catch { return undefined; }
           };
           let cwd = null;
@@ -2005,7 +2024,12 @@ export function apply(ctx, config) {
               // 注意它是同步返回 receipt 的，不是 async —— 但 await 一个非 Promise 也无害，
               // 而另一版要是改成 async 也照样能用，所以这里统一 await。
               const subSvc = (() => {
-                try { return typeof ctx.get === 'function' ? ctx.get('subagents') : undefined; } catch { return undefined; }
+                // 0.2.6：strict=false，理由同 svc()——subagents 不在 inject 里，
+                // fiber 可能未 ACTIVE，strict 查询会误报「没有这个服务」。
+                try {
+                  if (typeof ctx.get !== 'function') return undefined;
+                  return ctx.get('subagents', false) ?? ctx.get('subagents');
+                } catch { return undefined; }
               })();
               if (typeof subSvc?.interruptByParent === 'function') {
                 try {
@@ -2368,12 +2392,27 @@ export function apply(ctx, config) {
       'agent.get': { status: has(() => typeof ctx.agents?.get === 'function'), required: true },
       'subagent.resolve_name': { status: subCaps.resolveName, required: false },
       'subagent.list_children': { status: subCaps.listChildren, required: false },
-      // 这三项必须走 ctx.get()：直取会在 cordis 4.x 抛 `without inject`，
-      // has() 的 try/catch 会把错吞掉，于是自检恒报 unsupported——
-      // 等于这行字本身就是那个 bug 的另一面（cwd 缺陷报告 §3.3）。
-      'sandbox.confine': { status: has(() => typeof ctx.get?.('sandbox')?.confine === 'function'), required: false },
-      'sandbox.policy': { status: has(() => typeof ctx.get?.('sandboxPolicy')?.resolve === 'function'), required: false },
-      'working_directory': { status: has(() => typeof ctx.get?.('workingDirectory')?.ensure === 'function'), required: true },
+      // 这三项必须走 ctx.get()：直取会在 cordis 4.x 抛 `without inject`。
+      //
+      // 0.2.6 关键修正：**必须传 strict=false**。
+      // 宿主 Context.get 的原文（从 app.asar 读出来）：
+      //     get(name, strict = true) { return getTraceable(this.ctx, this._getImpl(name, strict)?.value); }
+      //     _getImpl(name, strict = true) {
+      //       const impl = key && this.store[key];
+      //       if (!impl) return;
+      //       if (strict && impl.fiber.state !== 2) return;   // ← ACTIVE = 2
+      //       return impl;
+      //     }
+      // 也就是说：**strategy=true 时只返回 fiber 已 ACTIVE 的服务**。
+      // workingDirectory / sandbox / sandboxPolicy 这三个恰好是本插件没 inject 的服务，
+      // 加载时序上它们的 fiber 未进入 ACTIVE —— 于是 ctx.get(name) 返回 undefined，
+      // 自检报 unsupported，而这个「不支持」是假的：服务确实存在（cordis inspect 验过）。
+      //
+      // 日志证据：这三个**同时** unsupported，而它们正是没 inject 的那三个；
+      // inject 过的 jobs/agents/tools 全部 supported。这不是巧合。
+      'sandbox.confine': { status: has(() => typeof ctx.get?.('sandbox', false)?.confine === 'function'), required: false },
+      'sandbox.policy': { status: has(() => typeof ctx.get?.('sandboxPolicy', false)?.resolve === 'function'), required: false },
+      'working_directory': { status: has(() => typeof ctx.get?.('workingDirectory', false)?.ensure === 'function'), required: true },
       'system_prompt.section': { status: has(() => typeof ctx.systemPrompt?.section === 'function'), required: false },
     };
 
@@ -2530,12 +2569,14 @@ export function apply(ctx, config) {
     d.updateTaskFields(t.id, {
       status,
       currentStage: 'settled',
-      // 失败的把原始 stopReason 留下来，别只说「失败了」
-      errorSummary: failed ? `end: ${raw || '(空 stopReason)'}`.slice(0, 200) : (cancelled ? (t.errorSummary ?? '执行器确认停止') : undefined),
+      // 失败的把原始 stopReason 留下来，别只说「失败了」。
+      // 0.2.6 补：raw 来自宿主的 stopReason / status / reason / outcome 兜底链，
+      // 不保证只有枚举词 —— 照样过一遍 redactSecrets 再落库。
+      errorSummary: failed ? redactSecrets(`end: ${raw || '(空 stopReason)'}`).slice(0, 200) : (cancelled ? (t.errorSummary ?? '执行器确认停止') : undefined),
       resultSummary: cancelled ? undefined
         : failed ? undefined
           : unknownReason
-            ? `子代理已结束（原生 subagent/end；stopReason=${trimmed || '未给出'}，非失败词）`
+            ? redactSecrets(`子代理已结束（原生 subagent/end；stopReason=${trimmed || '未给出'}，非失败词）`)
             : '子代理已结束（原生 subagent/end）',
       updatedAt: Date.now(),
       completedAt: Date.now(),
@@ -2634,8 +2675,9 @@ export function apply(ctx, config) {
         d.updateTaskFields(t.id, {
           status: terminal,
           currentStage: 'settled',
-          resultSummary: terminal === 'succeeded' ? String(detail ?? '作业正常结束').slice(0, 300) : undefined,
-          errorSummary: terminal !== 'succeeded' ? String(detail ?? terminal).slice(0, 300) : undefined,
+          // 0.2.6 补：同上一处，任务摘要落库要脱敏（detail 是命令输出摘要，可能含密钥）
+          resultSummary: terminal === 'succeeded' ? redactSecrets(String(detail ?? '作业正常结束')).slice(0, 300) : undefined,
+          errorSummary: terminal !== 'succeeded' ? redactSecrets(String(detail ?? terminal)).slice(0, 300) : undefined,
           updatedAt: Date.now(),
           completedAt: Date.now(),
         });

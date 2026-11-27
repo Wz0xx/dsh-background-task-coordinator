@@ -21,9 +21,15 @@ export function getSubagentsService(ctx) {
   // 只走 ctx.get()：cordis 4.x 里直取未 inject 的属性会抛
   // `cannot get property "subagents" without inject`，而 subagents 不在本插件的
   // inject 列表里（也不能加 —— 加了整个插件不启动，见 cwd 缺陷报告 §3.4）。
+  //
+  // 0.2.6：必须传 strict=false。
+  // 宿主 Context.get(name, strict = true) 在 strict 时只返回 fiber 已 ACTIVE(2) 的服务；
+  // subagents 的服务 fiber 未必在插件加载时就 ACTIVE，strict 查询会返回 undefined，
+  // 于是所有「按名字反查会话 id」的路径全被判成「宿主不支持」。
+  // 实测症状：compat 里 subagent.resolve_name / list_children 同时报 unsupported。
   try {
-    if (typeof ctx?.get === 'function') {
-      const viaGet = ctx.get('subagents');
+    if (typeof ctx.get === 'function') {
+      const viaGet = ctx.get('subagents', false) ?? ctx.get('subagents');
       if (viaGet) return viaGet;
     }
   } catch { /* 服务不存在或宿主不认这个键 */ }
@@ -63,7 +69,13 @@ export async function resolveSubagentBinding(ctx, agentName, caller, given) {
 
   const sub = getSubagentsService(ctx);
   const getSvc = (k) => {
-    try { return typeof ctx?.get === 'function' ? ctx.get(k) : undefined; } catch { return undefined; }
+    // 0.2.6：strict=false。宿主 ctx.get(name, strict=true) 只返回 fiber 已 ACTIVE 的服务，
+    // agents / sessions 未必在插件加载时就 ACTIVE —— strict 查询会误报「没有这个服务」，
+    // 于是下面的父会话核验整段被跳过，降级成「零校验」。
+    try {
+      if (typeof ctx?.get !== 'function') return undefined;
+      return ctx.get(k, false) ?? ctx.get(k);
+    } catch { return undefined; }
   };
 
   // 辅助核验 1：检查 agents 句柄与 sessions 元数据中声明的父会话字段。
@@ -110,7 +122,26 @@ export async function resolveSubagentBinding(ctx, agentName, caller, given) {
     const canList = typeof sub?.listDescendants === 'function' || typeof sub?.listChildren === 'function';
     const canResolve = typeof sub?.resolveName === 'function';
     if (!canList && !canResolve) {
-      // 宿主未提供任何 subagents 归属枚举/解析能力：依赖 metadata 与调用方台账跨会话唯一校验
+      // 宿主未提供任何 subagents 归属枚举/解析能力：只能依赖 metadata 与台账跨会话唯一性。
+      //
+      // 这一层**不做强判断**，只拦一种明确的坏情况：
+      //   candidateSid 与 agentName 都给了，但 agents 服务明确知道有这个 sid、
+      //   而它跟传进来的名字对不上 —— 那是把别的 agent 的 id 按到自己名下。
+      // 其余（查不到、服务不可用、注册表还没登记）一律放行：
+      //   原生工具刚返回 sessionId 时 agents 往往还没登记，硬拒会打断正常流程。
+      const agents = getSvc('agents');
+      if (agents && typeof agents.get === 'function') {
+        try {
+          const ag = agents.get(candidateSid);
+          if (ag && typeof ag === 'object') {
+            const agName = ag.name ?? ag.agentName ?? ag.label ?? null;
+            // 明确有名字且和传进来的 agent 名不一致 → 拒绝（把别人的 id 按到自己名下）
+            if (agName && name && String(agName) !== name) {
+              return { ok: false, verified: false, reason: `会话 ${candidateSid} 属于 agent "${agName}"，与传入的 "${name}" 不符` };
+            }
+          }
+        } catch { /* 查询失败按放行处理，交给台账唯一性兜底 */ }
+      }
       return { ok: true, verified: metadataConfirmed };
     }
     if (canList) {
