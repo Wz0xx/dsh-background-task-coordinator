@@ -31,7 +31,186 @@ export function getSubagentsService(ctx) {
 }
 
 /**
- * 名字 → 会话 id。取不到一律返回 null，绝不把名字当 id 落库。
+ * 名字 → 会话 id（带父子归属校验，0.2.4）。
+ *
+ * 返回结构 `{ sid, rejected, verified, reason }`：
+ *   - `rejected: true` 表示目标会话被判定不属于当前父会话（或无法通过可用 subagents 服务核验），
+ *     调用方必须拒绝首次绑定，防止共享 profile 下借别人的子代理 sessionId 跨会话发指令或取消；
+ *   - `sid` 为已校验/解析出的子代理会话 id，解析不到为 null。
+ *
+ * @param {object} ctx              Cordis 上下文
+ * @param {string} agentName        原生 subagent 工具给的 agent 名
+ * @param {object|undefined} caller 发起方 agent（需要 .session.id 作父会话）
+ * @param {string} given            调用方自己填的 sessionId（可能是名字，也可能真的是 id）
+ * @returns {Promise<{sid: string|null, rejected: boolean, verified: boolean, reason?: string}>}
+ */
+export async function resolveSubagentBinding(ctx, agentName, caller, given) {
+  const name = String(agentName ?? '').trim();
+  if (!name) return { sid: null, rejected: false, verified: false };
+
+  // 父会话 id 一次算好，全链路共用：三个字段形状都认 —— caller.session.id / caller.sessionId / caller.id。
+  const parentSid = caller?.session?.id ?? caller?.sessionId ?? caller?.id ?? null;
+  const parentStr = parentSid ? String(parentSid) : null;
+  const hasRealParent = !!parentStr && !/^(current|null|undefined|none|unknown)$/i.test(parentStr);
+
+  const sub = getSubagentsService(ctx);
+  const getSvc = (k) => {
+    try { return typeof ctx?.get === 'function' ? ctx.get(k) : undefined; } catch { return undefined; }
+  };
+
+  // 辅助核验 1：检查 agents 句柄与 sessions 元数据中声明的父会话字段。
+  // 只要明确带了父会话字段且与当前父会话不相等，直接判越权拒绝。
+  const checkMetadataParent = (candidateSid) => {
+    let confirmed = false;
+    const agents = getSvc('agents');
+    if (agents && typeof agents.get === 'function') {
+      try {
+        const ag = agents.get(candidateSid);
+        if (ag && typeof ag === 'object') {
+          const agParent = ag.parentSessionId ?? ag.parentId
+            ?? ag.session?.parentSessionId ?? ag.session?.parentId
+            ?? ag.ownerSessionId ?? null;
+          if (agParent) {
+            if (!hasRealParent || String(agParent) !== parentStr) {
+              return { ok: false, confirmed: false, reason: `子代理会话 ${candidateSid} 的父会话与当前调用者不一致` };
+            }
+            confirmed = true;
+          }
+        }
+      } catch { /* 查询抛错不作为通过依据，交给后续 subagents 核验 */ }
+    }
+    const sessions = getSvc('sessions');
+    if (sessions && typeof sessions.get === 'function') {
+      try {
+        const sess = sessions.get(candidateSid);
+        const hdr = sess?.header ?? sess;
+        const sessParent = hdr?.parentSessionId ?? hdr?.parentId ?? hdr?.ownerSessionId ?? null;
+        if (sessParent) {
+          if (!hasRealParent || String(sessParent) !== parentStr) {
+            return { ok: false, confirmed: false, reason: `会话 ${candidateSid} 的父会话元数据与当前调用者不一致` };
+          }
+          confirmed = true;
+        }
+      } catch { /* 同上 */ }
+    }
+    return { ok: true, confirmed };
+  };
+
+  // 辅助核验 2：利用宿主原生 subagents 服务（listDescendants / listChildren / resolveName）
+  // 权威验证调用方传入的 candidateSid 是否确实属于当前父会话的子树。
+  const verifyViaSubagents = async (candidateSid, metadataConfirmed) => {
+    const canList = typeof sub?.listDescendants === 'function' || typeof sub?.listChildren === 'function';
+    const canResolve = typeof sub?.resolveName === 'function';
+    if (!canList && !canResolve) {
+      // 宿主未提供任何 subagents 归属枚举/解析能力：依赖 metadata 与调用方台账跨会话唯一校验
+      return { ok: true, verified: metadataConfirmed };
+    }
+    if (canList) {
+      if (!hasRealParent) {
+        return { ok: false, verified: false, reason: '缺少有效的当前父会话 id，无法核验子代理归属' };
+      }
+      try {
+        const rawList = typeof sub.listDescendants === 'function'
+          ? await sub.listDescendants(parentStr)
+          : await sub.listChildren(parentStr);
+        const list = Array.isArray(rawList) ? rawList : [];
+        if (list.some((k) => k && String(k.id) === String(candidateSid))) {
+          return { ok: true, verified: true };
+        }
+      } catch {
+        // list 查询失败时如果还能通过 caller-scoped resolveName 确认则放行，否则 fail-closed
+        if (canResolve && caller) {
+          try {
+            const r = await sub.resolveName(caller, name);
+            if (r && String(r) !== name && String(r) === String(candidateSid)) {
+              return { ok: true, verified: true };
+            }
+          } catch { /* 落到拒绝 */ }
+        }
+        return { ok: false, verified: false, reason: '核验子代理归属失败（subagents 服务异常），拒绝盲绑' };
+      }
+      // 不在子列表中：再给 resolveName 一次机会（兼容 listChildren 只列直接子级而目标由 resolveName 确认的情况）
+      if (canResolve && caller) {
+        try {
+          const r = await sub.resolveName(caller, name);
+          if (r && String(r) !== name && String(r) === String(candidateSid)) {
+            return { ok: true, verified: true };
+          }
+        } catch { /* 落到拒绝 */ }
+      }
+      return { ok: false, verified: false, reason: `子代理会话 ${candidateSid} 不属于当前父会话的子代理列表` };
+    }
+    // 只有 resolveName（无 listChildren/listDescendants）
+    if (!caller) {
+      return { ok: false, verified: false, reason: '缺少调用者身份，无法通过 resolveName 核验子代理归属' };
+    }
+    try {
+      const r = await sub.resolveName(caller, name);
+      if (r && String(r) !== name) {
+        if (String(r) === String(candidateSid)) return { ok: true, verified: true };
+        return { ok: false, verified: false, reason: `给定会话 ${candidateSid} 与当前会话解析出的 ${name}（${r}）不一致` };
+      }
+    } catch { /* 落到下面 */ }
+    if (metadataConfirmed) return { ok: true, verified: true };
+    return { ok: false, verified: false, reason: `无法证明会话 ${candidateSid} 属于当前会话（resolveName 未命中）` };
+  };
+
+  // 调用方明确给了 sessionId 且不等于 agent 名：先过格式/占位词/自指过滤，再强制做归属核验（0.2.4）。
+  const g = String(given ?? '').trim();
+  if (g && g !== name) {
+    const isPlaceholder = /^(current|null|undefined|none|unknown)$/i.test(g);
+    const isParentItself = !!parentStr && g === parentStr;
+    const looksLikeId = g.length >= 4 && !/\s/.test(g) && !/^[\u4e00-\u9fa5]+$/.test(g);
+    if (!isPlaceholder && !isParentItself && looksLikeId) {
+      const meta = checkMetadataParent(g);
+      if (!meta.ok) return { sid: null, rejected: true, verified: false, reason: meta.reason };
+      const tree = await verifyViaSubagents(g, meta.confirmed);
+      if (!tree.ok) return { sid: null, rejected: true, verified: false, reason: tree.reason };
+      return { sid: g, rejected: false, verified: tree.verified };
+    }
+    // 不像 id / 是占位词 / 是父会话自己：进反查，别把它当 id 落库。
+  }
+
+  if (!sub) return { sid: null, rejected: false, verified: false };
+
+  // ---- 路径一：0.2.2+ 的 resolveName（按调用者作用域解析名字） ----
+  if (typeof sub.resolveName === 'function' && caller) {
+    try {
+      const sid = await sub.resolveName(caller, name);
+      // resolveName 对「不是名字的单个 token」会原样返回该 token，相等等于没解析出来；同时防自指。
+      if (sid && String(sid) !== name && (!parentStr || String(sid) !== parentStr)) {
+        const resolved = String(sid);
+        const meta = checkMetadataParent(resolved);
+        if (!meta.ok) return { sid: null, rejected: true, verified: false, reason: meta.reason };
+        return { sid: resolved, rejected: false, verified: true };
+      }
+    } catch { /* 落到路径二 */ }
+  }
+
+  // ---- 路径二：0.2.1 的 listChildren（只扫当前父会话的子级目录，按 label 匹配） ----
+  if (typeof sub.listChildren === 'function' && hasRealParent) {
+    try {
+      const kids = await sub.listChildren(parentStr);
+      const hits = (Array.isArray(kids) ? kids : []).filter((k) => k && String(k.label ?? '') === name);
+      if (hits.length > 0) {
+        if (hits.length > 1) {
+          hits.sort((a, b) => Number(b.createdAt ?? 0) - Number(a.createdAt ?? 0));
+        }
+        const resolved = String(hits[0].id);
+        if (resolved !== parentStr) {
+          const meta = checkMetadataParent(resolved);
+          if (!meta.ok) return { sid: null, rejected: true, verified: false, reason: meta.reason };
+          return { sid: resolved, rejected: false, verified: true };
+        }
+      }
+    } catch { /* 拿不到就 null */ }
+  }
+
+  return { sid: null, rejected: false, verified: false };
+}
+
+/**
+ * 名字 → 会话 id（兼容旧签名的便捷包装）。取不到或归属校验拒绝一律返回 null。
  *
  * @param {object} ctx              Cordis 上下文
  * @param {string} agentName        原生 subagent 工具给的 agent 名
@@ -40,85 +219,8 @@ export function getSubagentsService(ctx) {
  * @returns {Promise<string|null>}
  */
 export async function resolveSubagentSessionId(ctx, agentName, caller, given) {
-  const name = String(agentName ?? '').trim();
-  if (!name) return null;
-
-  // 父会话 id 一次算好，两处都要用（0.2.3，Gemini 补丁采纳）：
-  // 三个字段形状都认 —— caller.session.id / caller.sessionId / caller.id。
-  // 0.2.2 只在下面的 listChildren 路径里取，导致「拿 given 做自指检查」这一步做不到。
-  const parentSid = caller?.session?.id ?? caller?.sessionId ?? caller?.id ?? null;
-
-  // 调用方明确给了、且不等于 agent 名 → 要用，但**先核实它真的是一个会话 id**
-  // （0.2.1 修 P1-6，0.2.3 补两个漏网）。
-  //
-  // 0.2.0 是「给了就信」：`if (g && g !== name) return g;` 直接原样落库。
-  // 问题是这个字段由模型填，什么都能塞进去 —— 一个随手写的「随便」「abc」会被当成
-  // 会话 id 存进 native_session_id，之后所有按 id 的探活、结算匹配、取消全部落空。
-  //
-  // 判据要**松到不打断正常时序**（原生工具刚返回 sessionId 时，agents 注册表往往还没登记；
-  // 测试/其它宿主也可能用 `sess-xxx` 这种短 id）：
-  //   ① 排除占位字面量（current/null/undefined/none/unknown）—— 0.2.3 补：
-  //      这些词能过长度检查，但它们**绝不是 id**，而且 `current` 恰好是
-  //      task_create 的 conversationId 默认值，最容易混进来；
-  //   ② 排除「父会话自己」—— 0.2.3 补：把父 id 当成子会话 id 落库，
-  //      会让这个任务永远匹配不上真正的 subagent/end（事件带的是子会话 id）；
-  //   ③ 排除明显是话不是 id 的（空、含空格、纯中文、长度 < 4）；
-  //   ④ 注册表能查到 → 确认；查不到 → 接受但算「未核实」，不当成已确认。
-  const g = String(given ?? '').trim();
-  if (g && g !== name) {
-    const isPlaceholder = /^(current|null|undefined|none|unknown)$/i.test(g);
-    const isParentItself = !!parentSid && g === String(parentSid);
-    // 「像 id」= 无空白、非全中文、长度 >= 4。
-    // 会话 id 的真实形态在这些宿主里并不统一（UUID、session-xxx、sess-F1 都见过），
-    // 所以不能按某一种格式硬卡，只能排除明显是话而不是 id 的。
-    const looksLikeId = g.length >= 4 && !/\s/.test(g) && !/^[\u4e00-\u9fa5]+$/.test(g);
-    if (!isPlaceholder && !isParentItself && looksLikeId) {
-      const agents = (() => {
-        try { return typeof ctx?.get === 'function' ? ctx.get('agents') : undefined; } catch { return undefined; }
-      })();
-      if (agents && typeof agents.get === 'function') {
-        try {
-          if (agents.get(g)) return g;   // 注册表里有 → 确认是活会话 id
-        } catch { /* 查询抛错 → 下面按未核实处理 */ }
-      }
-      // 格式过得去、注册表暂时查不到（或没有 agents 服务）：接受，但未核实。
-      return g;
-    }
-    // 不像 id / 是占位词 / 是父会话自己：进反查，别把它当 id 落库。
-  }
-
-  const sub = getSubagentsService(ctx);
-  if (!sub) return null;
-
-  // ---- 路径一：0.2.2+ 的 resolveName（按名字解析） ----
-  if (typeof sub.resolveName === 'function' && caller) {
-    try {
-      const sid = await sub.resolveName(caller, name);
-      // resolveName 对「不是名字的单个 token」会原样返回该 token（当 session id 用），
-      // 所以相等就等于没解析出来 —— 这行不能省。
-      if (sid && String(sid) !== name) return String(sid);
-    } catch { /* 落到路径二 */ }
-  }
-
-  // ---- 路径二：0.2.1 的 listChildren（扫父会话的子级目录，按 label 匹配） ----
-  //
-  // parentSid 在函数开头就算好了（0.2.3 提到上面，因为「排除父会话自己」那一步也要它）。
-  // 取法要全：0.2.0 只认 `caller.session.id` 和 `caller.sessionId`，漏了 `caller.id` ——
-  // 而空态兜底造出来的 caller 恰恰是 `{ session: {...}, id }` 形态，别的宿主也可能只给 .id。
-  if (typeof sub.listChildren === 'function' && parentSid) {
-    try {
-      const kids = await sub.listChildren(parentSid);
-      const hits = (Array.isArray(kids) ? kids : []).filter((k) => k && String(k.label ?? '') === name);
-      if (hits.length === 1) return String(hits[0].id);
-      if (hits.length > 1) {
-        // 同名多个：取最新创建的那个。这是 best-effort，调用方应知道存在歧义。
-        hits.sort((a, b) => Number(b.createdAt ?? 0) - Number(a.createdAt ?? 0));
-        return String(hits[0].id);
-      }
-    } catch { /* 拿不到就 null */ }
-  }
-
-  return null;
+  const res = await resolveSubagentBinding(ctx, agentName, caller, given);
+  return res.rejected ? null : res.sid;
 }
 
 /**

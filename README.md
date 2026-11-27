@@ -146,9 +146,9 @@ background jobs unavailable: no job controller serves this agent
 3. **Windows 主要路径实测过。** GBK 解码、`taskkill /T` 这些都有平台分支，Linux / macOS 没测。
 4. **数据是一个 SQLite 库**：`~/.dsh/background-task-coordinator/<profile>/tasks.db`（WAL 模式）。可以直接看（`node:sqlite` 或任意 sqlite3 客户端）、直接删——删了下次启动重建空账，不影响 DSH。
 
-   **0.2.0 起按 profile 隔离。** 以前所有 profile 共用一个库，开第二个 profile 时它的启动对账查不到第一个 profile 内存里的 job/agent，会把正在跑的任务全标 `lost`。现在路径里带 profile 名（取 `DSH_PROFILE_DIR` 的 basename，没有就用 `DSH_PROFILE`，都没有是 `default`）。**旧库不会自动搬**——串台路径不清不楚，搬错比不搬更糟；要留老数据就手动 copy 到新目录（连同 `-wal`、`-shm` 一起）。
+   **0.2.0 起按 profile 隔离，0.2.4 防同名 profile 串库。** 位于默认 `~/.dsh/profiles/<name>` 下的 profile 沿用 `~/.dsh/background-task-coordinator/<name>/tasks.db`；若来自不同根目录、自定义 `DSH_HOME` 或清洗截断后的名字，自动附带完整路径 8 位 SHA-256 指纹（`<name>-<hash>`），避免不同目录下的同名 profile（如两个 `default`）共用同一份库。POSIX 下目录自动收紧为 `0700`、库文件为 `0600`。
 
-   旧版的 `tasks.json` 会在首次启动时自动迁进来，迁完改名 `.migrated` 保留。
+   **落盘脱敏与旧 JSON 清理（0.2.4）**：写进 SQLite 的命令目标、已落盘追加指令、上下文与事件流水会自动对常见内联凭据（`KEY=`/`TOKEN=`/`PASSWORD=`、`Bearer`、`sk-`/`ghp_`/`AKIA`、`--token`、URL 密码）脱敏（不影响实际运行参数）；旧版 `tasks.json` 迁入并 checkpoint 落盘后直接删除源文件，并清理历史遗留的 `tasks.json.migrated` 明文副本。
 
 5. **限额与超时可配**，三层来源，后者盖前者：内置默认 → `cordis.patch.yml` 的 `config` → 环境变量 `DSH_COORD_LIMITS`（JSON）。
 
@@ -241,12 +241,12 @@ background jobs unavailable: no job controller serves this agent
 | `stopReason` 空串落 `failed` | 假失败（和以前假成功一样糟） | 按宿主真实枚举映射，空串落 `succeeded` 但注明「未给出原因」 |
 | **`cmd /s /c` 把引号拼成字面量**（新发现） | 任何带引号/带空格的命令都报 `Cannot find module '..."..."'` | `spawn` 加 `windowsVerbatimArguments`（仅 danger-full-access 分支） |
 
-测试三套，**117 项全绿**（0.2.3 起）：
+测试三套，**146 项全绿**（0.2.4 起）：
 
 ```
 主回归      16/16
 下游补丁     9/9
-专项       92/92
+专项      121/121
 ```
 
 其中几条是专门设计成「能反驳自己」的——比如断言旧 `listTasks({limit:500})` 写法在 601 条台账下**确实漏掉活动任务**，用来证明修的是真 bug。迁移那条用本机真实旧库（含 2.1 MB WAL）跑过：29 任务 / 53 事件 / 5 消息全保留。
@@ -329,6 +329,28 @@ background jobs unavailable: no job controller serves this agent
 - `settleNotification` 仍只记账 —— 我 0.2.2 已改成真投递，比它进一步
 - 没有 `sweepJobsOnce` —— 我 0.2.2 新增的 job 探活它没有
 - 把 `db()`/`emitEvent` 等模块级函数全挪进 `apply` —— 思路对（解决热重载互相覆写），但改动 300+ 行、风险集中，记进待办单独做
+
+## 九点九、0.2.4 改了什么
+
+对 0.2.3 做完逐条实测复核后，把最后一批代码级漏洞和边缘回退一次收干净，逐条见 `docs/0.2.4改动记录-20261128.md`：
+
+| 问题 | 0.2.3 的状态 | 现状 |
+|---|---|---|
+| 原生 `jobs.events` 结算重复通知 | 误传 `selfProduced: true`，每个 job 结束都给发起会话重发一条 `followup` | 去掉 `selfProduced: true`，与 `subagent/end` 和通知设计对齐 |
+| `sweepJobsOnce` 跨会话 + 异常计 miss | `task_list` 调 job 探活没传 `caller`，且 `jobs.get` 抛瞬时异常也会累加 `missStreak` 误杀成 `lost` | 传 `caller` 做归属隔离；查询抛错仅记日志跳过，不计 miss |
+| `earlyEnds` 回放后仍补投 `pending` | 早到结算已把任务落终态，仍调 `ag.followup` 唤醒已结束子代理；且早到缓存丢弃 `status/reason/outcome` 且无容量上限 | 回放落终态后取消待补投消息（标 `cancelled`，不唤醒子代理）；保留四字段兜底并封顶 200 条 |
+| `task_cancel` 兜底 `interruptByParent` 传 `undefined` | 读的是 `t.ownerSessionId`，但 `toTaskHandle(row)` 没有这个字段 | 改为 `own.caller ?? row.ownerSessionId ?? undefined` |
+| `task_list` 首次未命中提示是死代码 | 只在 `rows.length === 0` 分支拼接 `suspectNote`，有活动任务时永远看不到 | 非空列表顶部同样带出 `suspectNote` |
+| 空 `exec.agent` 仍冒充 `own.owner` | `task_describe` 与 `task_cancel` 的 `jobs.kill` 回退到 `own.owner`，违背 `ownedBy`「不冒充 caller」约定 | 均改为 `own.caller ?? undefined` |
+| 超时清账漏掉无 `sessionId` 的 `subagent` | `task_cancel` 把绑定但无 `nativeSessionId` 的任务留在 `cancel_requested` 等超时收尾，但 `sweepTimer` 没处理这类任务 | `sweepTimer` 对超时的未绑定或 `cancel_requested` 无会话 id 子代理落 `lost` 并通知 |
+| `dispose()` 遗留悬挂引用 | 顶部注释写明卸载清 `ACTIVE_CTX`，但 `dispose()` 漏清 `ACTIVE_CTX` / `_log` / 内存缓存 | 卸载时按实例比对清理 `ACTIVE_CTX`、`_log`、`missStreak`、`earlyEnds` |
+| `tests/v020.mjs:173` 硬编码本机路径 | 写死 `C:/Users/stop/...`，换机跑 `npm test` 直接 `ENOENT` | 改为相对模块路径 `new URL('../index.js', import.meta.url)` |
+| 后台命令继承宿主凭据 | `spawn` 透传 `sandboxed.env` 仍铺在完整 `process.env` 上，无 `sandboxed.env` 时更是直接继承全量 `process.env` | 对齐 DSH `scrubbedParentEnv()`，过滤 `KEY/PASSWORD/PASSWD/SECRET/TOKEN/CREDENTIAL` 与 `DSH_*` 后再叠加 `sandboxed.env` |
+| 首次绑定未验证子代理父子归属 | 共享 profile 下会话 B 可给自己的任务首次传入 A 的子代理 `sessionId`，继而跨会话发指令或取消 | 新增 `resolveSubagentBinding()`，结合 `subagents`（`listDescendants`/`listChildren`/`resolveName`）、`agents`/`sessions` 父会话字段与 SQLite 跨会话唯一校验拒绝越权首次绑定 |
+| `jobs.kill` 忽略回执过早报「已取消」 | DSH 的 `jobs.kill()` 可仅返回 `'requested'`（进程仍在 `stopping`），插件直接写 `cancelled` 并告知用户「已取消」 | 消费 `jobs.kill` 回执并复核 `jobs.get` / 同步 settled：`'requested'` 或原生仍运行/停止中时落 `cancel_requested`，等原生终态确认 |
+| 同名 profile 串库 + 明文留存 + `.migrated` 副本 | `dataDir()` 仅取 basename；命令/追加指令明文入库；旧 `tasks.json` 迁移后留 `.migrated` 副本 | 非默认根目录/自定义 `DSH_HOME` 加 8 位路径指纹隔离；SQLite 落盘脱敏且 POSIX 目录 `0700`/库 `0600`；迁移 checkpoint 后删源并清遗留 `.migrated` |
+
+顺带收尾三处细节：`task_create` 识别仅有 `exec.agent.session.id` 的宿主、`task_describe`/`task_append_message` 在 `nativeSessionId` 为空时不再拿 agent 名字碰按 session id 索引的注册表、`task_context` 拒绝浮点 `expectedVersion`（如 `1.5`）。
 
 ## 十、许可
 

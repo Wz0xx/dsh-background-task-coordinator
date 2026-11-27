@@ -16,9 +16,10 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { spawn } from 'node:child_process';
-import { randomUUID } from 'node:crypto';
+import { randomUUID, createHash } from 'node:crypto';
 import {
   resolveSubagentSessionId,
+  resolveSubagentBinding,
   probeSubagentCapabilities,
   getAgentHandle,
 } from './compat/subagents-adapter.js';
@@ -46,56 +47,134 @@ const PROMPT_TEXT = `## 后台任务
 
 伙伴说了「放后台」就直接建，不用问要不要；他没说但这件事明显要跑很久，建完告他一声就行。任务结束会自己回来告诉结果，不用一直盯着查。`;
 
-const HOME_DATA = path.join(os.homedir(), '.dsh', 'background-task-coordinator');
-
 /**
- * 台账库路径（0.2.0 按 profile 隔离）。
+ * 台账库路径（0.2.0 按 profile 隔离；0.2.4 防同名 profile 路径碰撞）。
  *
- * 以前所有 profile 写同一个 `~/.dsh/background-task-coordinator/tasks.db`（审计 P2-7）：
- * 开第二个 profile 时，它的启动对账查不到第一个 profile 内存里的 job/agent，
- * 会把正在跑的任务**全部标 lost**——这是会真丢状态的串台。
+ * 以前所有 profile 写同一个 `~/.dsh/background-task-coordinator/tasks.db`（审计 P2-7）；
+ * 0.2.0–0.2.3 仅取 `DSH_PROFILE_DIR` 的 basename，若两套不同根目录/不同 world 下存在
+ * 同名 profile（例如两个不同目录的 `default`），仍会共用同一个 tasks.db 并互相标 lost。
  *
- * 现在路径是 `~/.dsh/background-task-coordinator/<profile>/tasks.db`：
- *   - 有 DSH_PROFILE_DIR 用它（宿主给的真值，最准）；
- *   - 否则用 DSH_PROFILE / DSH_PROFILE_NAME 的名字；
- *   - 都没有（直接 node 跑测试）→ `default`。
- * 旧库不自动搬：串台路径不清不楚，搬错比不搬更糟。要留老数据就手动 copy 到新目录。
+ * 0.2.4 规则（Gemini 版）：非默认根目录 / 名字需清洗时加 8 位路径指纹，避免同名串库。
+ *
+ * 0.2.5 融合（本机必需）：把 `config.profile` 重新接成**第一来源**。
+ *   Gemini 版只认环境变量，因为他的 Linux 部署里环境变量能传进插件进程；
+ *   本机实测传不进来（日志原文：数据目录 ...\background-task-coordinator\default），
+ *   只靠环境变量会落回 default\，和真数据（desktop\）再次分家。
+ *   现在：config.profile → env.DSH_PROFILE_DIR → env.DSH_PROFILE → default，
+ *   且 config 来的名字**同样**参与指纹计算（两个不同 profile 同名时也不会撞）。
  */
 function dataDir(configHint) {
-  // 三级来源（0.2.4 修：前两级在宿主里都拿不到）。
-  //
-  // 实测记录：宿主启动参数明确是 {"profile":"desktop"}，主进程环境变量里
-  // DSH_PROFILE_DIR / DSH_PROFILE 也都对，但**插件在 host 子进程里读 process.env 时**
-  // 这两个键是空的 —— 所以 0.2.0–0.2.3 全部落到了 `default`。日志原文：
-  //   数据目录 C:\Users\...\background-task-coordinator\default
-  // 也就是说这两个变量宿主自己用，没传给插件所在进程。
-  //
-  // 真值顺序：
-  //   ① config 里宿主传进来的 profile（apply 第二参）
-  //   ② process.env.DSH_PROFILE_DIR（宿主真传了就用）
-  //   ③ process.env.DSH_PROFILE / DSH_PROFILE_NAME
-  //   ④ 都没有（`node tests/...` 直接跑）→ default
+  const home = os.homedir();
+  const baseRoot = path.join(home, '.dsh', 'background-task-coordinator');
+  const sanitize = (s) => s.replace(/[\\/:*?"<>|\u0000-\u001f]/g, '_').slice(0, 48) || 'default';
+  const shortHash = (p) => {
+    const norm = process.platform === 'win32' ? p.toLowerCase() : p;
+    return createHash('sha256').update(norm).digest('hex').slice(0, 8);
+  };
+  const samePath = (a, b) => (process.platform === 'win32'
+    ? a.toLowerCase() === b.toLowerCase()
+    : a === b);
+
+  // ① config.profile（0.2.5 融合）：宿主通过 patch 配置传进来的 profile 名。
+  // 它可能是完整路径，也可能只是一个名字 —— 两种都处理。
   const fromConfig = String(
     (configHint && typeof configHint === 'object'
       ? (configHint.profile ?? configHint.profileName)
       : '') ?? '',
   ).trim();
-  const rawDir = String(process.env.DSH_PROFILE_DIR ?? '').trim();
-  let tag = '';
   if (fromConfig) {
-    tag = fromConfig;
-  } else if (rawDir) {
-    tag = path.basename(rawDir.replace(/[\\/]+$/, ''));
-  } else {
-    tag = String(process.env.DSH_PROFILE ?? process.env.DSH_PROFILE_NAME ?? '').trim();
+    // 看起来像路径（含分隔符）就按路径走，否则当纯名字。
+    const looksLikePath = /[\\/]/.test(fromConfig);
+    if (looksLikePath) {
+      const resolved = path.resolve(fromConfig.replace(/[\\/]+$/, ''));
+      const base = path.basename(resolved);
+      const name = sanitize(base);
+      const stdProfilesRoot = path.resolve(home, '.dsh', 'profiles');
+      if (samePath(path.dirname(resolved), stdProfilesRoot) && base === name) {
+        return path.join(baseRoot, name);
+      }
+      return path.join(baseRoot, `${name}-${shortHash(resolved)}`);
+    }
+    const name = sanitize(fromConfig);
+    // 名字被清洗/截断过 → 加指纹，避免两个不同名字映射到同一个目录
+    if (name !== fromConfig) {
+      return path.join(baseRoot, `${name}-${shortHash(fromConfig)}`);
+    }
+    return path.join(baseRoot, name);
   }
-  // profile 名要当目录名用：去掉路径分隔符和 Windows 非法字符，其余原样保留。
-  tag = tag.replace(/[\\/:*?"<>|\u0000-\u001f]/g, '_').slice(0, 64) || 'default';
-  return path.join(HOME_DATA, tag);
+
+  const raw = String(process.env.DSH_PROFILE_DIR ?? '').trim();
+  if (raw) {
+    const cleaned = raw.replace(/[\\/]+$/, '');
+    const resolved = path.resolve(cleaned);
+    const base = path.basename(resolved);
+    const name = sanitize(base);
+    const stdProfilesRoot = path.resolve(home, '.dsh', 'profiles');
+    if (samePath(path.dirname(resolved), stdProfilesRoot) && base === name) {
+      return path.join(baseRoot, name);
+    }
+    return path.join(baseRoot, `${name}-${shortHash(resolved)}`);
+  }
+
+  const envName = String(process.env.DSH_PROFILE ?? process.env.DSH_PROFILE_NAME ?? '').trim();
+  const tag = sanitize(envName);
+  const dshHome = String(process.env.DSH_HOME ?? '').trim();
+  if (dshHome) {
+    const resolvedHome = path.resolve(dshHome);
+    const stdHome = path.resolve(home, '.dsh');
+    if (!samePath(resolvedHome, stdHome) || (envName && envName !== tag)) {
+      return path.join(baseRoot, `${tag}-${shortHash(`${resolvedHome}\0${envName}`)}`);
+    }
+  } else if (envName && envName !== tag) {
+    return path.join(baseRoot, `${tag}-${shortHash(envName)}`);
+  }
+  return path.join(baseRoot, tag);
 }
 
 function dbPath(configHint) {
   return path.join(dataDir(configHint), 'tasks.db');
+}
+
+// ---------------------------------------------------------------------------
+// 0.2.4：子进程环境过滤（对齐 DSH packages/subprocess/subprocess/src/index.ts#L73-L80）
+// ---------------------------------------------------------------------------
+// 子进程绝不继承完整 process.env（哪怕是 sandbox.confine 透传了部分 env，也不能把未覆盖的
+// 宿主 API KEY / TOKEN / PASSWORD / SECRET / CREDENTIAL 或 DSH_* 内部变量带进后台命令）。
+const SENSITIVE_ENV_RE = /(?:KEY|PASSWORD|PASSWD|SECRET|TOKEN|CREDENTIAL)/i;
+function scrubbedParentEnv(baseEnv = process.env) {
+  const out = {};
+  for (const [k, v] of Object.entries(baseEnv || {})) {
+    if (v === undefined) continue;
+    if (SENSITIVE_ENV_RE.test(k)) continue;
+    if (k.toUpperCase().startsWith('DSH_')) continue;
+    out[k] = v;
+  }
+  return out;
+}
+
+/**
+ * 0.2.4：落盘脱敏 —— 将命令、追加指令、上下文与事件流水中明显的内联凭据替换为 [REDACTED]。
+ * 只用于写 SQLite 与日志留痕，绝不改写实际传给 spawn 或 ag.followup/steer 的运行时内容。
+ */
+function redactSecrets(input) {
+  let s = String(input ?? '');
+  if (!s) return s;
+  s = s.replace(/\b(Authorization\s*:\s*)(?:Bearer|Basic|Token)\s+[^\s'",;]+/gi, '$1[REDACTED]');
+  s = s.replace(/\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{12,}/g, '$1 [REDACTED]');
+  s = s.replace(
+    /\b(?:sk-(?:ant-|proj-)?[A-Za-z0-9_-]{12,}|gh[pousr]_[A-Za-z0-9_]{16,}|github_pat_[A-Za-z0-9_]{16,}|AKIA[0-9A-Z]{16}|xox[baprs]-[A-Za-z0-9-]{10,}|AIza[0-9A-Za-z_-]{30,})\b/g,
+    '[REDACTED]',
+  );
+  s = s.replace(
+    /\b([A-Za-z_][A-Za-z0-9_]*(?:API_?KEY|SECRET|TOKEN|PASS(?:WORD|WD)?|CREDENTIAL)[A-Za-z0-9_]*)\s*=\s*(?:"[^"]*"|'[^']*'|[^\s&;|]+)/gi,
+    '$1=[REDACTED]',
+  );
+  s = s.replace(
+    /(--(?:api-?key|access-?token|auth-?token|token|secret|password|passwd))(\s+|=)(?:"[^"]*"|'[^']*'|[^\s&;|]+)/gi,
+    '$1$2[REDACTED]',
+  );
+  s = s.replace(/([a-zA-Z][a-zA-Z0-9+.-]*:\/\/[^/\s:@]+:)([^/\s@]+)(@)/g, '$1[REDACTED]$3');
+  return s;
 }
 
 // 子进程在中文 Windows 上默认吐 GBK。0.2.0 之前是「首个 chunk 试解一次就永久锁定编码」，
@@ -210,11 +289,12 @@ let _sqlite = null; // CoordinatorDatabase 单例
 // 模块级日志钩子：apply() 时注入，供 migrate 等模块级函数使用
 let _log = () => {};
 // 模块级 ctx 引用：settleNotification 这类模块级函数要给发起会话投消息，
-// 需要 agents 服务。apply() 时注入，dispose 时清掉（不留悬挂引用）：
+// 需要 agents 服务。apply() 时注入，dispose 时清掉（不留悬挂引用）。
 let ACTIVE_CTX = null;
-// 模块级 profile 提示：apply(config) 时从宿主配置里取，db()/dataDir() 要用。
-// 为什么不用 process.env：实测宿主**没把** DSH_PROFILE_DIR 传给插件所在进程
-// （主进程有、插件进程空），只靠环境变量会一直落到 default/（0.2.4 修）。
+// 模块级 profile 提示（0.2.5 融合）：apply(config) 时从宿主配置取，db()/dataDir() 要用。
+// 为什么必须留：本机插件进程读不到 DSH_PROFILE_DIR（宿主没传给 host 子进程），
+// 只靠环境变量会一直落到 default/。Gemini 版删掉了这条，他的 Linux 环境用不上，
+// 但这台机器必需。
 let _profileHint = '';
 
 function db() {
@@ -225,9 +305,20 @@ function db() {
   return _sqlite;
 }
 
-/** 旧 tasks.json → SQLite 一次性迁移。 */
+/** 旧 tasks.json → SQLite 一次性迁移（0.2.4：脱敏迁入、落盘后删除源明文副本并清理历史 .migrated）。 */
 function migrateJsonFileIfNeeded() {
-  const f = path.join(dataDir({ profile: _profileHint }), 'tasks.json');
+  const dir = dataDir({ profile: _profileHint });
+  // 0.2.4：如果此前旧版本（0.1.x–0.2.3）迁移后留下了 tasks.json.migrated 明文副本，
+  // 既然 SQLite 已成功打开，就清掉这份不受 retentionDays 管理的明文残留。
+  const legacyCopy = path.join(dir, 'tasks.json.migrated');
+  try {
+    if (fs.existsSync(legacyCopy)) {
+      fs.unlinkSync(legacyCopy);
+      _log('旧台账清理：已删除历史遗留的 tasks.json.migrated 明文副本');
+    }
+  } catch { /* 删除失败不阻塞启动 */ }
+
+  const f = path.join(dir, 'tasks.json');
   let raw;
   try {
     raw = JSON.parse(fs.readFileSync(f, 'utf8'));
@@ -243,6 +334,7 @@ function migrateJsonFileIfNeeded() {
     for (const t of Object.values(tasks)) {
       if (!t || typeof t !== 'object' || !t.id) continue;
       const status = OLD_MAP[t.status] ?? t.status;
+      const safeObj = redactSecrets(t.objective ?? '');
       // 逐条幂等：任务主体已存在（上次迁移崩在半路的残余）就跳过插入。
       if (_sqlite.getTask(t.id)) { skip += 1; }
       else {
@@ -253,13 +345,13 @@ function migrateJsonFileIfNeeded() {
           type: t.type === 'subagent' ? 'subagent' : 'job',
           nativeId: t.nativeId ?? undefined,
           nativeSessionId: t.nativeSessionId ?? undefined,
-          title: t.title ?? '未命名任务',
-          objective: t.objective ?? '',
+          title: redactSecrets(t.title ?? '未命名任务'),
+          objective: safeObj,
           status: TERMINAL.has(status) || ACTIVE.has(status) ? status : 'lost',
           currentStage: t.stage ?? undefined,
           progressSummary: undefined,
-          resultSummary: t.resultSummary ?? undefined,
-          errorSummary: t.errorSummary ?? undefined,
+          resultSummary: t.resultSummary ? redactSecrets(t.resultSummary) : undefined,
+          errorSummary: t.errorSummary ? redactSecrets(t.errorSummary) : undefined,
           priority: 5,
           createdAt: t.createdAt ?? Date.now(),
           updatedAt: t.updatedAt ?? Date.now(),
@@ -275,7 +367,7 @@ function migrateJsonFileIfNeeded() {
           messageId: m.mid ?? `msg-${randomUUID()}`,
           taskId: t.id,
           sender: m.sender ?? 'user',
-          content: m.content ?? '',
+          content: redactSecrets(m.content ?? ''),
           idempotencyKey: m.idempotencyKey ?? `legacy:${t.id}:${m.mid ?? randomUUID()}`,
           status: m.status === 'delivered' ? 'delivered' : 'undeliverable',
           channel: m.mode === 'next-step' ? 'agent-inbox-next-step' : 'agent-inbox-next-turn',
@@ -290,12 +382,12 @@ function migrateJsonFileIfNeeded() {
           _sqlite.insertContext({
             taskId: t.id,
             version: t.context.version ?? 1,
-            objective: t.objective ?? '',
-            currentStage: t.context.stage,
+            objective: safeObj,
+            currentStage: t.context.stage ? redactSecrets(t.context.stage) : undefined,
             done: [],
-            decisions: t.context.decisions ?? [],
-            changedFiles: t.context.changedFiles ?? [],
-            pendingIssues: t.context.pending ?? [],
+            decisions: Array.isArray(t.context.decisions) ? t.context.decisions.map(redactSecrets) : [],
+            changedFiles: Array.isArray(t.context.changedFiles) ? t.context.changedFiles.map(redactSecrets) : [],
+            pendingIssues: Array.isArray(t.context.pending) ? t.context.pending.map(redactSecrets) : [],
             updatedAt: t.context.updatedAt ?? t.updatedAt ?? Date.now(),
           });
         } catch { /* 单条失败跳过（含重复迁移时已存在的情况），不阻断整体 */ }
@@ -308,13 +400,15 @@ function migrateJsonFileIfNeeded() {
           eventId: e.eventId ?? `ev-${randomUUID()}`,
           taskId: e.taskId,
           eventType: e.type ?? 'task-progress',
-          payload: e.payload ? { note: String(e.payload).slice(0, 300) } : undefined,
+          payload: e.payload ? { note: redactSecrets(String(e.payload)).slice(0, 300) } : undefined,
           createdAt: e.at ?? Date.now(),
         });
       } catch { /* 外键缺失等：单条跳过 */ }
     }
-    fs.renameSync(f, f + '.migrated');
-    _log(`旧台账迁移：${n} 条任务从 tasks.json 迁入 SQLite${skip ? `（跳过已存在的 ${skip} 条）` : ''}，原文件改名 .migrated`);
+    // 0.2.4：确认 SQLite 落盘后直接删除旧 tasks.json，不再改名 .migrated 永久留一份明文副本。
+    _sqlite.checkpoint?.();
+    fs.unlinkSync(f);
+    _log(`旧台账迁移：${n} 条任务从 tasks.json 迁入 SQLite${skip ? `（跳过已存在的 ${skip} 条）` : ''}，已删除原 JSON 文件`);
   } catch (e) {
     _log(`tasks.json 迁移失败（SQLite 照常使用）：${String(e).slice(0, 160)}`);
   }
@@ -420,7 +514,7 @@ function emitEvent(_dbRef, taskId, type, _actor, payload) {
       eventId: `ev-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`,
       taskId,
       eventType: type,
-      payload: payload === undefined || payload === null || payload === '' ? undefined : { note: String(payload).slice(0, 300) },
+      payload: payload === undefined || payload === null || payload === '' ? undefined : { note: redactSecrets(String(payload)).slice(0, 300) },
       createdAt: Date.now(),
     });
   } catch { /* 任务还没落库时先发事件会外键失败：静默 */ }
@@ -530,13 +624,14 @@ export function apply(ctx, config) {
   const log = (msg) => logger?.info?.(`[task-coordinator] ${msg}`);
   _log = log; // 模块级函数（migrate 等）也要能打日志
   ACTIVE_CTX = ctx;   // settleNotification 要给发起会话投消息，需要 agents 服务
-  // profile 提示：宿主在启动参数里明确给了（`{"profile":"desktop"}`），
-  // 但没通过环境变量传给插件进程。这里从 config 取，取不到再退回环境变量。
+  // profile 提示（0.2.5 融合）：宿主在启动参数里给了 {"profile":"desktop"}，
+  // 但没通过环境变量传给插件进程 —— 所以必须从 config 取。
   _profileHint = String(
     (PLUGIN_CFG.profile ?? PLUGIN_CFG.profileName ?? '') || '',
   ).trim();
-  // 打出实际用到的目录（0.2.4）：这一行是排查「数据落到 default/」的唯一线索，
-  // 以前只在注册工具时打一次，且不带来源信息。
+  // 打出实际用到的目录与来源：这一行是排查「数据落到 default/」的唯一线索。
+  // 上一轮我改错了文件（改的是仓库里那份 cordis.patch.yml，运行时读的是 profile 里那份），
+  // 就是靠这行 `来源：fallback(default)` 当场暴露的。
   {
     const resolved = dataDir({ profile: _profileHint });
     const src = _profileHint ? 'config.profile'
@@ -742,13 +837,14 @@ export function apply(ctx, config) {
    * 这里做的是：对活动中的 job，主动问一次原生 `ctx.jobs.get`。
    *   - 拿到了且已是终态 → 就地落账（与 settled 事件走同一套映射）
    *   - 拿到了还在跑 → 清计数
-   *   - 查不到（抛错/undefined）→ 连击计数，同 subagent 的规则：连续 N 轮才判 lost
+   *   - 查不到（undefined）→ 连击计数，同 subagent 的规则：连续 N 轮才判 lost
+   *   - 查询抛错 → 记录日志本轮跳过，不计 miss（避免瞬时异常误杀）
    *
-   * 用 caller = 台账 owner：这里和启动对账同理，是「替每条任务各自核实自己」，不是借身份看别人。
+   * 归属隔离：从 task_list 调用时传 caller（只探活自己的 job）；维护循环传 null（全量核对）。
    *
    * @returns {number} 本轮补落的条数
    */
-  function sweepJobsOnce(d) {
+  function sweepJobsOnce(d, caller = null) {
     let swept = 0;
     // 原生 job 状态 → 台账状态。未知状态返回 null（不猜，交给下一轮）。
     const stMap = (s) => {
@@ -760,6 +856,9 @@ export function apply(ctx, config) {
     };
     for (const t of d.listActive([...ACTIVE])) {
       if (t.type !== 'job' || !t.nativeId) continue;
+      // 归属隔离（0.2.4）：从 task_list 调用时传 caller，只探活自己的 job，不跨会话动别人台账；
+      // 维护循环（caller=null）仍全量核对。
+      if (caller && t.ownerSessionId && String(t.ownerSessionId) !== String(caller)) continue;
       let view;
       let err = null;
       try {
@@ -768,21 +867,9 @@ export function apply(ctx, config) {
         err = e;
       }
       if (err) {
-        // 查询本身失败 ≠ job 没了。按「不确定」处理，走连击计数。
-        const n = bumpMiss(t.id, Date.now());
-        if (n >= MISS_THRESHOLD) {
-          d.updateTaskFields(t.id, {
-            status: 'lost',
-            currentStage: 'reconciled',
-            errorSummary: `连续 ${MISS_THRESHOLD} 轮查不到原生 job（loast error: ${String(err?.message ?? err).slice(0, 100)}）`,
-            updatedAt: Date.now(),
-            completedAt: Date.now(),
-          });
-          emitEvent(null, t.id, 'task.lost', 'reconciler', 'job 探活兜底');
-          settleNotification(null, { id: t.id, status: 'lost', ownerSessionId: t.ownerSessionId, title: t.title }, { selfProduced: true });
-          clearMiss(t.id);
-          swept += 1;
-        }
+        // 0.2.4 对齐 sweepOnce 语义：查询本身抛异常 ≠ job 已消失，
+        // 本轮跳过不计 miss，防止瞬时注册表异常把活 job 误杀成不可逆 lost。
+        log(`job 探活异常，本轮跳过 ${t.id}：${String(err?.message ?? err).slice(0, 120)}`);
         continue;
       }
       if (!view) {
@@ -852,8 +939,8 @@ export function apply(ctx, config) {
         if (!objective.trim()) return { ok: false, text: 'objective 不能为空' };
         // 注册表认的真实会话 id（0.2.2 起 start(spec) 强制解析 spec.owner 的活 agent；
         // 字面量 "current" 会报 session "current" has no live agent）。
-        // 写进台账 ownerSessionId，后续 kill/readAt/get 全带它做 caller（assertAccess 围栏）。
-        const ownerSessionId = String(exec?.agent?.id ?? '') || conversationId;
+        // 0.2.4：复用 callerSessionId，同时识别 exec.agent.id 与 exec.agent.session.id。
+        const ownerSessionId = callerSessionId(exec) || conversationId;
 
         // ---- 资源治理（任务书表 6 / A11）：创建执行器前原子占位 ----
         const d = db();
@@ -881,6 +968,9 @@ export function apply(ctx, config) {
 
         const id = newTaskId();
         const deadlineAt = Date.now() + LIMITS.timeoutMinutes * 60_000;
+        // 0.2.4：落入 SQLite 的标题与目标做内联凭据脱敏；实际执行命令行仍取原始 objective 第一行。
+        const safeTitle = redactSecrets(title);
+        const safeObjective = redactSecrets(objective);
         // 先落库（queued），再推进状态——SQLite 同步事务，启动失败也留痕。
         // deadline 落 labels JSON 列（schema 不加列），sweep 从读回的 labels.deadlineAt 取。
         d.insertTask({
@@ -888,8 +978,8 @@ export function apply(ctx, config) {
           conversationId,
           ownerSessionId,
           type: realType,
-          title,
-          objective,
+          title: safeTitle,
+          objective: safeObjective,
           status: 'queued',
           currentStage: 'created',
           priority: 5,
@@ -897,8 +987,8 @@ export function apply(ctx, config) {
           updatedAt: Date.now(),
           labels: { deadlineAt: String(deadlineAt), deadlineMinutes: String(LIMITS.timeoutMinutes) },
         });
-        emitEvent(null, id, 'task.created', 'model', `type=${realType} title=${title} deadline=${LIMITS.timeoutMinutes}min`);
-        const t = { id, conversationId, type: realType, title, objective, status: 'queued', nativeId: null, stage: 'created', deadlineAt };
+        emitEvent(null, id, 'task.created', 'model', `type=${realType} title=${safeTitle} deadline=${LIMITS.timeoutMinutes}min`);
+        const t = { id, conversationId, type: realType, title: safeTitle, objective: safeObjective, status: 'queued', nativeId: null, stage: 'created', deadlineAt };
 
         if (realType === 'job') {
           const registry = ctx.jobs;
@@ -1096,9 +1186,10 @@ export function apply(ctx, config) {
                   // sandbox.confine 返回的 argv 里常有 `C:\Program Files\...` 这类带空格路径，
                   // 跳过转义会把它们劈成多个错误参数。所以按 argv 的来源决定，不无条件开。
                   windowsVerbatimArguments: process.platform === 'win32' && verbatim,
-                  // 沙箱要求的环境变量（0.2.3）：宿主 env 作底，沙箱覆盖在上。
-                  // 没有 env 时不传这个键，让 Node 用默认继承（避免无谓地复制一大份 env）。
-                  ...(sandboxedEnv ? { env: { ...process.env, ...sandboxedEnv } } : {}),
+                  // 0.2.4：对齐 DSH 原生 scrubbedParentEnv()，过滤宿主凭据类环境变量（KEY/PASSWORD/SECRET/TOKEN/CREDENTIAL）
+                  // 与 DSH_* 内部变量；不再把未过滤的完整 process.env 继承或铺底到子进程中。
+                  // 若 sandbox.confine 返回了显式 env，则叠加在已过滤的父环境之上。
+                  env: sandboxedEnv ? { ...scrubbedParentEnv(), ...sandboxedEnv } : scrubbedParentEnv(),
                   // 非 Windows 上让子进程自成一个进程组，cancel 时才能整组杀干净；
                   // Windows 用 taskkill /T 走进程树，不需要这个。
                   detached: process.platform !== 'win32',
@@ -1145,6 +1236,7 @@ export function apply(ctx, config) {
                         const killer = spawn('taskkill', ['/T', '/F', '/PID', String(child.pid)], {
                           windowsHide: true,
                           stdio: 'ignore',
+                          env: scrubbedParentEnv(),
                           // 这里是独立调用，没有引号拼接，让 Node 正常转义即可
                           windowsVerbatimArguments: false,
                         });
@@ -1242,7 +1334,7 @@ export function apply(ctx, config) {
         // 0.2.3：传 caller 做归属隔离，只探活自己的任务，不改别人的状态（Gemini 补丁采纳）。
         const { swept, suspects } = sweepOnce(d, caller);
         if (swept) log(`探活兜底：${swept} 条 subagent 任务原生已回收，补落 lost`);
-        const sweptJobs = sweepJobsOnce(d);
+        const sweptJobs = sweepJobsOnce(d, caller);
         if (sweptJobs) log(`job 探活：${sweptJobs} 条已按原生状态补账`);
         const visible = (t) => {
           if (!caller) return true;
@@ -1282,6 +1374,9 @@ export function apply(ctx, config) {
         const lines = rows.map((t) =>
           `${t.id}  [${t.status}]  ${t.title}  (${t.type}${t.nativeId ? `/${t.nativeId}` : ''})  ${new Date(t.createdAt).toLocaleString()}`,
         );
+        // 0.2.4 修：有 suspect 时该任务仍在 ACTIVE，必然走 rows.length > 0 分支，
+        // 之前漏了把 suspectNote 插进输出，导致提示文案永远不可达。
+        if (suspectNote) lines.unshift(suspectNote);
         if (swept) lines.unshift(`（本轮探活补落 ${swept} 条 lost）`);
         return { ok: true, text: lines.join('\n') };
       },
@@ -1328,21 +1423,26 @@ export function apply(ctx, config) {
         // subagent：真源在 DSH，台账只是投影 —— 这里现查一次原生 agent。
         // 只读：查不到只提示，不改台账状态（改状态是 task_list / subagent/end 的事）。
         if (t.type === 'subagent' && (t.nativeSessionId || t.nativeId)) {
-          try {
-            const ag = getAgentHandle(ctx, t);
-            if (!ag) {
-              lines.push('原生 agent：查不到（可能已结束回收）');
-              if (ACTIVE.has(t.status)) {
-                lines.push('  ↳ 台账仍记 ' + t.status + '。要落终态请调 task_list（会做探活补落），'
-                  + '或 task_cancel 显式取消。describe 自己不写台账。');
+          if (!t.nativeSessionId) {
+            // 0.2.4：未解析出真 session id 时不拿 agent 名查 ctx.agents，避免误报「可能已回收」。
+            lines.push('原生 agent：未解析出会话 id（无法按 session id 探活）');
+          } else {
+            try {
+              const ag = getAgentHandle(ctx, t);
+              if (!ag) {
+                lines.push('原生 agent：查不到（可能已结束回收）');
+                if (ACTIVE.has(t.status)) {
+                  lines.push('  ↳ 台账仍记 ' + t.status + '。要落终态请调 task_list（会做探活补落），'
+                    + '或 task_cancel 显式取消。describe 自己不写台账。');
+                }
+              } else {
+                const keys = Object.getOwnPropertyNames(ag).slice(0, 14).join(',');
+                lines.push(`原生 agent：keys=${keys}`);
+                lines.push(`原生 status=${JSON.stringify(ag.status)}`);
               }
-            } else {
-              const keys = Object.getOwnPropertyNames(ag).slice(0, 14).join(',');
-              lines.push(`原生 agent：keys=${keys}`);
-              lines.push(`原生 status=${JSON.stringify(ag.status)}`);
+            } catch (e) {
+              lines.push(`原生状态查询失败：${String(e).slice(0, 120)}`);
             }
-          } catch (e) {
-            lines.push(`原生状态查询失败：${String(e).slice(0, 120)}`);
           }
         }
         if (t.stage && t.stage !== t.status) lines.push(`阶段：${t.stage}`);
@@ -1365,12 +1465,9 @@ export function apply(ctx, config) {
           for (const e of evs) lines.push(`  ${new Date(e.createdAt).toLocaleTimeString()} [${e.eventType}] ${e.payload?.note ?? ''}`);
         }
         // Job 输出非消耗读。有主 job 的 get/readAt 受 assertAccess 围栏：
-        // caller 必须是**真实的调用者**（0.2.1，审计 P0-3 回归项）。
-        //
-        // 0.2.0 这里用的是 rowFull.ownerSessionId —— 那是「谁创建的」，不是「现在谁在调」。
-        // 等于替别人的任务冒充 owner 去读输出，把 DSH 0.2.2 的 assertAccess 围栏直接穿透了。
-        // 上面已经过了 ownedBy，所以这里 caller 要么是真的调用者，要么拿不到身份（历史兼容）。
-        const caller = own.caller ?? own.owner ?? undefined;
+        // 0.2.4 彻底落齐 ownedBy 契约：只传真实调用者 own.caller，拿不到身份时传 undefined，
+        // 绝不再回退用 row.ownerSessionId 冒充 owner 穿透 0.2.2 围栏。
+        const caller = own.caller ?? undefined;
         if (t.type === 'job' && t.nativeId && ctx.jobs?.get) {
           try {
             const jv = ctx.jobs.get(t.nativeId, caller);
@@ -1456,12 +1553,27 @@ export function apply(ctx, config) {
         // 台账里记着 ownerSessionId，拿它造一个最小 caller 再试。
         const caller = exec?.agent
           ?? (row.ownerSessionId ? { session: { id: row.ownerSessionId }, id: row.ownerSessionId } : undefined);
-        const realSid = await resolveSubagentSessionId(
+        // 0.2.4：首次绑定强校验子代理归属（父子关系），阻止共享 profile 下把别人的子代理 sessionId 绑到自己的任务上。
+        const binding = await resolveSubagentBinding(
           ctx,
           agentName,
           caller,
           String(args?.sessionId ?? ''),
         );
+        if (binding.rejected) {
+          return { ok: false, text: `拒绝绑定：${binding.reason}。` };
+        }
+        const realSid = binding.sid;
+        if (realSid) {
+          // 额外防线：即便宿主没有 subagents 枚举服务，也不允许把已归属其他会话的 nativeSessionId 绑到当前任务。
+          const conflict = d.findTaskByNativeSessionOtherOwner(realSid, row.ownerSessionId);
+          if (conflict) {
+            return {
+              ok: false,
+              text: `拒绝绑定：会话 ${realSid} 已归属其他会话的任务，禁止跨会话绑定。`,
+            };
+          }
+        }
         // queued → starting → running（V1.1 表 3：不再直达）
         const from = row.status;
         if (from === 'queued') d.updateTaskFields(tid, { status: 'starting', updatedAt: Date.now() });
@@ -1491,7 +1603,10 @@ export function apply(ctx, config) {
             earlyEnds.delete(String(realSid));
             // 重读一次拿最新行（上面的 updateTaskFields 刚写过）
             const fresh = d.getTask(tid);
-            const st = settleFromSubagentEnd(d, toTaskHandle(fresh), String(early.info?.stopReason ?? ''));
+            const rawReason = String(
+              early.info?.stopReason ?? early.info?.status ?? early.info?.reason ?? early.info?.outcome ?? '',
+            );
+            const st = settleFromSubagentEnd(d, toTaskHandle(fresh), rawReason);
             replayText = `\n注意：这个子代理在登记之前就已经结束了（subagent/end 早到），`
               + `已按早到的结束事件直接落 ${st}。`;
             log(`早到结算回放：${tid} → ${st}`);
@@ -1503,39 +1618,66 @@ export function apply(ctx, config) {
         // 但这里根本没有 flush 逻辑 —— 消息永久卡在 pending，而且内容哈希幂等键
         // 还会让用户重发同样的指令时被「已是 pending，未重复投递」挡回去。
         // 现在绑定成功后立刻把 pending 全投一遍，投不出去的如实改成 undeliverable。
+        //
+        // 0.2.4：如果上面的早到结算回放已经把任务落了终态，绝不能再对已结束的子代理调
+        // followup/steer（那会把已结束的 session 重新唤醒）；改为把绑定前排队的 pending
+        // 统一标为 cancelled 并说明。
         const flushLines = [];
         let flushed = 0;
         try {
           const pend = d.listPendingMessages(tid);
           if (pend.length) {
-            const ag = getAgentHandle(ctx, { nativeId: agentName, nativeSessionId: realSid ?? null });
-            for (const m of pend) {
-              if (!ag) {
-                // 绑定成功但 agent 还拿不到句柄（宿主注册表滞后 / 没有 agents 服务）：
-                // 别把 pending 改成失败，留着下一轮；但不假装投出去了。
-                flushLines.push(`  补投未完成：${m.messageId}（拿不到 agent 句柄，仍记为 pending）`);
-                continue;
+            if (replayText) {
+              for (const m of pend) {
+                d.updateMessage(m.messageId, {
+                  status: 'cancelled',
+                  content: redactSecrets(m.content).slice(0, 500),
+                  reason: '任务在绑定前已结束（subagent/end 早到），取消待补投指令',
+                });
+                emitEvent(null, tid, 'task.message_cancelled', 'coordinator', `早到结算取消补投 ${m.messageId}`);
               }
-              try {
-                const message = {
-                  id: randomUUID(),
-                  role: 'user',
-                  content: [{ type: 'text', text: m.content }],
-                  source: { kind: 'user' },
-                };
-                if (typeof ag.followup === 'function') ag.followup(message);
-                else if (typeof ag.steer === 'function') ag.steer(message);
-                else throw new Error('这个 agent 没有 followup/steer');
-                d.updateMessage(m.messageId, { status: 'delivered', channel: 'agent-inbox-flush', deliveredAt: Date.now() });
-                emitEvent(null, tid, 'task.message_flushed', 'coordinator', `补投 ${m.messageId}`);
-                flushed += 1;
-              } catch (e) {
-                d.updateMessage(m.messageId, { status: 'undeliverable', reason: `补投失败: ${String(e).slice(0, 120)}` });
-                emitEvent(null, tid, 'task.message_failed', 'coordinator', `补投失败 ${m.messageId}`);
-                flushLines.push(`  补投失败：${m.messageId}（${String(e).slice(0, 80)}）`);
+              flushLines.push(`  任务绑定前已结束，已取消 ${pend.length} 条绑定前排队的待补投指令（未唤醒已结束的子代理）。`);
+            } else {
+              // 0.2.4：只有拿到真 sessionId 才查句柄，不再拿 agentName 去碰按 sessionId 索引的注册表
+              const ag = realSid ? getAgentHandle(ctx, { nativeId: agentName, nativeSessionId: realSid }) : undefined;
+              for (const m of pend) {
+                if (!ag) {
+                  // 绑定成功但 agent 还拿不到句柄（未解析出 sessionId / 宿主注册表滞后 / 没有 agents 服务）：
+                  // 别把 pending 改成失败，留着下一轮；但不假装投出去了。
+                  flushLines.push(`  补投未完成：${m.messageId}（${realSid ? '拿不到 agent 句柄' : '未解析出会话 id'}，仍记为 pending）`);
+                  continue;
+                }
+                try {
+                  const message = {
+                    id: randomUUID(),
+                    role: 'user',
+                    content: [{ type: 'text', text: m.content }],
+                    source: { kind: 'user' },
+                  };
+                  if (typeof ag.followup === 'function') ag.followup(message);
+                  else if (typeof ag.steer === 'function') ag.steer(message);
+                  else throw new Error('这个 agent 没有 followup/steer');
+                  // 0.2.4：补投完成后对库内留痕脱敏，避免长期保存明文凭据。
+                  d.updateMessage(m.messageId, {
+                    status: 'delivered',
+                    channel: 'agent-inbox-flush',
+                    content: redactSecrets(m.content).slice(0, 500),
+                    deliveredAt: Date.now(),
+                  });
+                  emitEvent(null, tid, 'task.message_flushed', 'coordinator', `补投 ${m.messageId}`);
+                  flushed += 1;
+                } catch (e) {
+                  d.updateMessage(m.messageId, {
+                    status: 'undeliverable',
+                    content: redactSecrets(m.content).slice(0, 500),
+                    reason: `补投失败: ${String(e).slice(0, 120)}`,
+                  });
+                  emitEvent(null, tid, 'task.message_failed', 'coordinator', `补投失败 ${m.messageId}`);
+                  flushLines.push(`  补投失败：${m.messageId}（${String(e).slice(0, 80)}）`);
+                }
               }
+              if (flushed) flushLines.unshift(`  已补投 ${flushed} 条绑定前排队的指令。`);
             }
-            if (flushed) flushLines.unshift(`  已补投 ${flushed} 条绑定前排队的指令。`);
           }
         } catch (e) {
           flushLines.push(`  补投过程出错（pending 保留）：${String(e).slice(0, 100)}`);
@@ -1587,6 +1729,8 @@ export function apply(ctx, config) {
         }
         const content = String(args?.content ?? '');
         if (!content.trim()) return { ok: false, text: '指令内容为空' };
+        // 0.2.4：落库与事件留痕走脱敏副本；实际投递到 ag.followup / ag.steer 仍用原始 content。
+        const safeContent = redactSecrets(content);
         const mode = args?.mode === 'next-step' ? 'next-step' : 'next-turn';
         const idem = String(args?.idempotencyKey ?? '').slice(0, 128);
         const mid = `msg-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
@@ -1631,14 +1775,14 @@ export function apply(ctx, config) {
             messageId: mid,
             taskId: tid,
             sender: 'user',
-            content: content.slice(0, 500),
+            content: safeContent.slice(0, 500),
             idempotencyKey: checkKey,
             status: 'undeliverable',
             channel: 'none',
             reason: 'job 无 stdin（原生契约）',
             createdAt: Date.now(),
           });
-          emitEvent(null, tid, 'task.message_appended', 'model', `undeliverable: ${content.slice(0, 80)}`);
+          emitEvent(null, tid, 'task.message_appended', 'model', `undeliverable: ${safeContent.slice(0, 80)}`);
           return { ok: false, text: `未投递：background job 不支持 stdin 追加（原生契约如此，不伪装）。指令已记录（${mid}），可排队为任务后续步骤或转交所属 subagent。` };
         }
         if (!t.nativeId) {
@@ -1650,6 +1794,7 @@ export function apply(ctx, config) {
             // pending 的正文必须**完整**存（0.2.1，审计 P1-5）：
             // 这条是要在绑定后补投给 agent 的，截到 500 字就等于把指令砍半投出去。
             // 上限放宽到 16000（远超任何正常指令），只是防超大 payload 撑爆库。
+            // 绑定补投完成或取消后会立即覆写为脱敏副本（见 task_register_delegation / task_cancel）。
             content: content.slice(0, 16000),
             idempotencyKey: checkKey,
             status: 'pending',
@@ -1660,9 +1805,24 @@ export function apply(ctx, config) {
           return { ok: false, text: '任务尚未绑定 subagent（先 task_register_delegation）。指令已登记为 pending，绑定后补投。' };
         }
         // 真实投递：ctx.agents.get(sessionId) 拿活着的 agent，调 followup / steer。
-        // ctx.agents 只按 session id 索引 —— 台账里 nativeId 是 agent 名，必须用 nativeSessionId
-        // （没解析出才退回名字，会查不到，那就是如实报不可达，不装作投出去了）。
-        //
+        // ctx.agents 只按 session id 索引 —— 0.2.4：nativeSessionId 为空时直接如实记 undeliverable，
+        // 不拿 agent 名字去碰按 session id 索引的注册表（避免把「未解析出会话 id」误报成「agent 已结束」）。
+        if (!t.nativeSessionId) {
+          mustPurge();
+          d.insertMessage({
+            messageId: mid,
+            taskId: tid,
+            sender: 'user',
+            content: safeContent.slice(0, 500),
+            idempotencyKey: checkKey,
+            status: 'undeliverable',
+            channel: 'none',
+            reason: '未解析到子代理会话 id（nativeSessionId 为空），无法按 session id 投递',
+            createdAt: Date.now(),
+          });
+          emitEvent(null, tid, 'task.message_appended', 'model', `undeliverable(no-session-id): ${safeContent.slice(0, 80)}`);
+          return { ok: false, text: `未投递：agent ${t.nativeId} 未解析出会话 id，无法按 session id 投递。指令已记录（${mid}）。` };
+        }
         // 必须接住异常（0.2.1，审计 #1）：0.1.10 起 getAgentHandle 会让 agents.get 的异常
         // 冒出来。这里不接的话工具直接崩，而且崩在上一步「删掉旧 pending 行」之后 ——
         // 那条消息就既没投出去也没留记录，凭空消失。
@@ -1688,7 +1848,7 @@ export function apply(ctx, config) {
             reason: `探活失败: ${String(probeErr?.message ?? probeErr).slice(0, 140)}`,
             createdAt: Date.now(),
           });
-          emitEvent(null, tid, 'task.message_appended', 'model', `probe-failed: ${content.slice(0, 60)}`);
+          emitEvent(null, tid, 'task.message_appended', 'model', `probe-failed: ${safeContent.slice(0, 60)}`);
           return { ok: false, text: `未投递：查询 agent ${t.nativeId} 时出错（${String(probeErr?.message ?? probeErr).slice(0, 140)}）。指令已留为 pending，稍后重试或再调一次。` };
         }
         if (!ag) {
@@ -1697,14 +1857,14 @@ export function apply(ctx, config) {
             messageId: mid,
             taskId: tid,
             sender: 'user',
-            content: content.slice(0, 500),
+            content: safeContent.slice(0, 500),
             idempotencyKey: checkKey,
             status: 'undeliverable',
             channel: 'none',
             reason: 'agent 已结束或不可达（原生 agents.get 查不到）',
             createdAt: Date.now(),
           });
-          emitEvent(null, tid, 'task.message_appended', 'model', `undeliverable: ${content.slice(0, 80)}`);
+          emitEvent(null, tid, 'task.message_appended', 'model', `undeliverable: ${safeContent.slice(0, 80)}`);
           return { ok: false, text: `未投递：agent ${t.nativeId} 已结束或不可达（原生 agents.get 查不到）。指令已记录（${mid}）。` };
         }
         try {
@@ -1724,14 +1884,14 @@ export function apply(ctx, config) {
             messageId: mid,
             taskId: tid,
             sender: 'user',
-            content: content.slice(0, 500),
+            content: safeContent.slice(0, 500),
             idempotencyKey: checkKey,
             status: 'delivered',
             channel: mode === 'next-step' ? 'agent-inbox-next-step' : 'agent-inbox-next-turn',
             createdAt: Date.now(),
             deliveredAt: Date.now(),
           });
-          emitEvent(null, tid, 'task.message_appended', 'model', `delivered(${mode}): ${content.slice(0, 80)}`);
+          emitEvent(null, tid, 'task.message_appended', 'model', `delivered(${mode}): ${safeContent.slice(0, 80)}`);
           const sid = t.nativeSessionId || t.nativeId;
           return { ok: true, text: `已投递到 agent ${t.nativeId}${t.nativeSessionId ? `（会话 ${sid}）` : ''}（${mid}，mode=${mode}）。busy 时进收件箱，下一可接收时机处理，不打断当前工具调用。` };
         } catch (e) {
@@ -1740,14 +1900,14 @@ export function apply(ctx, config) {
             messageId: mid,
             taskId: tid,
             sender: 'user',
-            content: content.slice(0, 500),
+            content: safeContent.slice(0, 500),
             idempotencyKey: checkKey,
             status: 'undeliverable',
             channel: 'none',
             reason: String(e).slice(0, 160),
             createdAt: Date.now(),
           });
-          emitEvent(null, tid, 'task.message_appended', 'model', `failed: ${content.slice(0, 80)}`);
+          emitEvent(null, tid, 'task.message_appended', 'model', `failed: ${safeContent.slice(0, 80)}`);
           return { ok: false, text: `投递失败：${String(e).slice(0, 200)}（${mid}）` };
         }
       },
@@ -1781,16 +1941,37 @@ export function apply(ctx, config) {
           return { ok: true, text: `取消已请求过（task ${tid}），等执行器确认，别重复发。` };
         }
         const t = toTaskHandle(row);
-        const reason = String(args?.reason ?? '用户取消').slice(0, 200);
+        const reason = redactSecrets(String(args?.reason ?? '用户取消')).slice(0, 200);
+        // 0.2.4：任务终态取消时顺带把库内残留的 pending 消息标为 cancelled 并脱敏，避免留明文。
+        const scrubPendingOnCancel = () => {
+          try {
+            for (const m of d.listPendingMessages(tid)) {
+              d.updateMessage(m.messageId, {
+                status: 'cancelled',
+                content: redactSecrets(m.content).slice(0, 500),
+                reason: '任务已取消，清理待补投指令',
+              });
+            }
+          } catch { /* 清理失败不阻塞取消 */ }
+        };
         let nativeOk = null;
+        let jobKillCaller = undefined;
+        let jobKillReceipt = undefined;
+        let jobKillCalled = false;
         try {
           if (t.type === 'job' && ctx.jobs?.kill) {
             // caller 必须是**真实的调用者**，不能用台账里的 ownerSessionId 冒充 ——
-            // 那等于替别人的任务假冒 owner，能杀掉本不该有权杀的任务（审计 P0-3）。
-            // 拿不到调用者身份时才退回 owner（历史任务/无 exec 的宿主）。
-            const killCaller = own.caller ?? own.owner ?? undefined;
-            ctx.jobs.kill(t.nativeId, killCaller, reason);
-            nativeOk = 'killed';
+            // 0.2.4：与 ownedBy「拿不到 caller 放行但不冒充」以及 task_describe 一致，
+            // 绝不再回退 own.owner 穿透 0.2.2 assertAccess 围栏。
+            jobKillCaller = own.caller ?? undefined;
+            // 0.2.4：读取 DSH 原生 jobs.kill 的回执（'requested' | 'already-finished' | ...），
+            // 不再忽略回执直接把还在 stopping 的后台作业写成「已取消」。
+            jobKillReceipt = ctx.jobs.kill(t.nativeId, jobKillCaller, reason);
+            jobKillCalled = true;
+            const rLabel = typeof jobKillReceipt === 'string'
+              ? jobKillReceipt
+              : (jobKillReceipt && typeof jobKillReceipt === 'object' && jobKillReceipt.status ? String(jobKillReceipt.status) : '');
+            nativeOk = rLabel ? `jobs.kill (${rLabel})` : 'jobs.kill';
           } else if (t.type === 'subagent') {
             // 真的去中断它，不是只写一句字符串（审计 P1-3）。
             //
@@ -1836,7 +2017,9 @@ export function apply(ctx, config) {
                 try {
                   await subSvc.interruptByParent(
                     t.nativeSessionId,
-                    own.caller ?? t.ownerSessionId,
+                    // 0.2.4：toTaskHandle(row) 不含 ownerSessionId，之前 t.ownerSessionId 恒为 undefined；
+                    // 改用 row.ownerSessionId（父会话 id）作为回退。
+                    own.caller ?? row.ownerSessionId ?? undefined,
                     'continuable',
                   );
                   nativeOk = 'subagents.interruptByParent';
@@ -1851,6 +2034,7 @@ export function apply(ctx, config) {
               // 也没有会到来的 subagent/end —— 以前这里被 `!hasRealId` 抢走，
               // 结果一个从没登记过的 queued 子代理点取消反而被锁进 cancel_requested
               // 永不落地（0.2.1，审计 #2）。这种直接收尾，事实清楚：它从来没跑起来过。
+              scrubPendingOnCancel();
               d.updateTaskFields(tid, {
                 status: 'cancelled',
                 currentStage: 'cancelled',
@@ -1869,6 +2053,7 @@ export function apply(ctx, config) {
             } else {
               // 已绑定 + 有真 id + 探活成功但查不到 = 原生已回收。
               // 没有可中断的对象，直接落终态，别留僵尸（审计 P0-2）。
+              scrubPendingOnCancel();
               d.updateTaskFields(tid, {
                 status: 'cancelled',
                 currentStage: 'cancelled',
@@ -1896,28 +2081,93 @@ export function apply(ctx, config) {
         } catch (e) {
           nativeOk = `cancel 调用失败: ${String(e).slice(0, 160)}`;
         }
-        // job：kill 调用即终局（原生契约），直接落 cancelled；
-        // subagent：interrupt 只是「请求」，确认要等原生 subagent/end —— 两个状态分开（任务书表 3 / A07）。
-        if (t.type === 'job' && nativeOk === 'killed') {
-          // 先重读现状（0.2.3，Gemini 补丁采纳）：
-          // ctx.jobs.kill() 可能在**同一个调用栈里**同步触发 jobs.events 的 settled 回调，
-          // 那条路径已经把任务落成 cancelled 并写过事件和通知账了。
-          // 这里再写一遍会：重复发 task.cancelled 事件、并且在新状态上再覆盖一次 errorSummary。
-          // 已经终态就什么都不做。
+        // 0.2.4：DSH 的 jobs.kill(id, caller, reason) 返回 'requested' | 'already-finished'：
+        //   - 'requested' / 'stopping' 表示已下发停止请求，进程可能仍在退出中 → 必须落 cancel_requested，
+        //     等原生 jobs.events settled（或探活）确认终态，绝不提前告诉用户「已取消」；
+        //   - 若 kill 在同调用栈内已同步触发 settled 回调，重读台账已是终态则直接沿用，不重复写；
+        //   - 'already-finished' 或无回执且 jobs.get 确认已终态/不存在，才直接落对应终态。
+        if (t.type === 'job' && jobKillCalled) {
           const cur = d.getTask(tid);
-          if (!cur || !TERMINAL.has(cur.status)) {
-            d.updateTaskFields(tid, { status: 'cancelled', currentStage: 'cancelled', errorSummary: reason, updatedAt: Date.now(), completedAt: Date.now() });
-            emitEvent(null, tid, 'task.cancelled', 'user', reason);
-            settleNotification(null, { id: tid, status: 'cancelled' });
+          if (cur && TERMINAL.has(cur.status)) {
+            t.status = cur.status;
+          } else {
+            const rNorm = (typeof jobKillReceipt === 'string'
+              ? jobKillReceipt
+              : String(jobKillReceipt?.status ?? '')).trim().toLowerCase();
+            const mapJobTerm = (s) => {
+              const v = String(s ?? '').toLowerCase();
+              if (v === 'completed') return 'succeeded';
+              if (v === 'failed') return 'failed';
+              if (v === 'killed' || v === 'cancelled') return 'cancelled';
+              return null;
+            };
+            let settledTerminal = null;
+            let settledDetail = null;
+            if (rNorm === 'requested' || rNorm === 'stopping') {
+              // 明确只是「已请求停止」：保持 cancel_requested，等原生 settled 确认
+              settledTerminal = null;
+            } else {
+              // 'already-finished' / 'killed' / 'not-found' 或无回执：再查一次 jobs.get 核实真实状态
+              let view = undefined;
+              let probed = false;
+              if (typeof ctx.jobs?.get === 'function') {
+                try {
+                  view = ctx.jobs.get(t.nativeId, jobKillCaller);
+                  probed = true;
+                } catch { /* 查不动则保守按 cancel_requested 处理 */ }
+              }
+              if (probed && view) {
+                const vt = mapJobTerm(view.status);
+                if (vt) {
+                  settledTerminal = vt;
+                  settledDetail = view.detail;
+                } else {
+                  // 原生仍明确报 running / stopping：不能谎报已取消
+                  nativeOk = `${nativeOk}（原生仍为 ${view.status}）`;
+                  settledTerminal = null;
+                }
+              } else if (probed && !view) {
+                // 注册表里已不存在该作业：确认终态
+                settledTerminal = 'cancelled';
+              } else if (rNorm === 'already-finished' || rNorm === 'finished' || rNorm === 'not-found' || rNorm === 'killed' || rNorm === 'cancelled') {
+                settledTerminal = 'cancelled';
+              }
+            }
+            if (settledTerminal) {
+              d.updateTaskFields(tid, {
+                status: settledTerminal,
+                currentStage: settledTerminal === 'cancelled' ? 'cancelled' : 'settled',
+                resultSummary: settledTerminal === 'succeeded' ? String(settledDetail ?? '作业已结束').slice(0, 300) : undefined,
+                errorSummary: settledTerminal !== 'succeeded' ? String(settledDetail ?? reason).slice(0, 300) : undefined,
+                updatedAt: Date.now(),
+                completedAt: Date.now(),
+              });
+              emitEvent(
+                null,
+                tid,
+                settledTerminal === 'succeeded' ? 'task.succeeded' : settledTerminal === 'failed' ? 'task.failed' : 'task.cancelled',
+                'user',
+                settledTerminal === 'cancelled' ? reason : String(settledDetail ?? settledTerminal).slice(0, 200),
+              );
+              settleNotification(null, { id: tid, status: settledTerminal });
+              t.status = settledTerminal;
+            } else {
+              d.updateTaskFields(tid, { status: 'cancel_requested', currentStage: 'cancelling', errorSummary: reason, updatedAt: Date.now() });
+              emitEvent(null, tid, 'task.cancel_requested', 'user', `${reason}（native: ${nativeOk ?? 'jobs.kill'}）`);
+              t.status = 'cancel_requested';
+            }
           }
-          t.status = 'cancelled';
         } else {
           d.updateTaskFields(tid, { status: 'cancel_requested', currentStage: 'cancelling', errorSummary: reason, updatedAt: Date.now() });
           emitEvent(null, tid, 'task.cancel_requested', 'user', `${reason}（native: ${nativeOk ?? '未绑定执行单元'}）`);
           t.status = 'cancel_requested';
         }
-        log(`取消：${tid}（${nativeOk}）`);
-        const stateWord = t.status === 'cancelled' ? '已取消' : '已请求取消（cancel_requested），等原生确认后落终态';
+        log(`取消：${tid}（${nativeOk} → ${t.status}）`);
+        const stateWord = t.status === 'cancelled'
+          ? '已取消'
+          : TERMINAL.has(t.status)
+            ? `已结束（${t.status}）`
+            : '已请求取消（cancel_requested），等原生确认后落终态';
         return { ok: true, text: `task ${tid} ${stateWord}。原生动作：${nativeOk ?? '无需（未绑定执行单元）'}。` };
       },
     }),
@@ -1961,7 +2211,7 @@ export function apply(ctx, config) {
         if (!own.ok) return { ok: false, text: `任务不存在：${args?.taskId}` };
 
         const clean = (v) => (Array.isArray(v) ? v : [])
-          .map((x) => String(x).slice(0, 200))
+          .map((x) => redactSecrets(String(x)).slice(0, 200))
           .slice(0, 20);
 
         const writing =
@@ -1976,7 +2226,7 @@ export function apply(ctx, config) {
           // 不带则用「刚读到的版本」——那仍然是乐观锁，但只能防住「读到写之间被人改」的
           // 极小窗口；两个代理各自读、各自写的情况必须靠显式传版本才能拦住。
           const wantVersion = args?.expectedVersion !== undefined ? Number(args.expectedVersion) : null;
-          if (wantVersion !== null && (!Number.isFinite(wantVersion) || wantVersion < 0)) {
+          if (wantVersion !== null && (!Number.isInteger(wantVersion) || wantVersion < 0)) {
             return { ok: false, text: `expectedVersion 必须是非负整数（收到 ${JSON.stringify(args.expectedVersion)}）。` };
           }
           const baseVersion = wantVersion !== null ? wantVersion : (ctxNow.version || 0);
@@ -1992,7 +2242,7 @@ export function apply(ctx, config) {
             taskId: tid,
             version: baseVersion + 1,
             objective: row.objective,
-            currentStage: args?.stage !== undefined ? String(args.stage).slice(0, 200) : (ctxNow.currentStage ?? ctxNow.stage),
+            currentStage: args?.stage !== undefined ? redactSecrets(String(args.stage)).slice(0, 200) : (ctxNow.currentStage ?? ctxNow.stage),
             done: ctxNow.done ?? [],
             decisions: args?.decisions !== undefined ? clean(args.decisions) : (ctxNow.decisions ?? []),
             changedFiles: args?.changedFiles !== undefined ? clean(args.changedFiles) : (ctxNow.changedFiles ?? []),
@@ -2106,16 +2356,8 @@ export function apply(ctx, config) {
   let compatReport = null;
   try {
     // 探测单个能力：读属性本身也可能抛（受控代理），一项抛不该拖垮整份报告。
-    // 但**不许把错误吞得无影无踪**（0.2.4）：以前 catch 里只返回 'unsupported'，
-    // 于是自检报「不支持」时，看不出是「服务真的没有」还是「查询本身抛了」。
-    // 现在把首个错误记下来，打进 compat 日志。
-    const capErrors = {};
-    const has = (fn, name) => {
-      try { return fn() ? 'supported' : 'unsupported'; }
-      catch (e) {
-        if (name) capErrors[name] = String(e?.message ?? e).slice(0, 120);
-        return 'unsupported';
-      }
+    const has = (fn) => {
+      try { return fn() ? 'supported' : 'unsupported'; } catch { return 'unsupported'; }
     };
     const subCaps = probeSubagentCapabilities(ctx);
     // caps 的每一项都带 required 标记：
@@ -2135,9 +2377,9 @@ export function apply(ctx, config) {
       // 这三项必须走 ctx.get()：直取会在 cordis 4.x 抛 `without inject`，
       // has() 的 try/catch 会把错吞掉，于是自检恒报 unsupported——
       // 等于这行字本身就是那个 bug 的另一面（cwd 缺陷报告 §3.3）。
-      'sandbox.confine': { status: has(() => typeof ctx.get?.('sandbox')?.confine === 'function', 'sandbox.confine'), required: false },
-      'sandbox.policy': { status: has(() => typeof ctx.get?.('sandboxPolicy')?.resolve === 'function', 'sandbox.policy'), required: false },
-      'working_directory': { status: has(() => typeof ctx.get?.('workingDirectory')?.ensure === 'function', 'working_directory'), required: true },
+      'sandbox.confine': { status: has(() => typeof ctx.get?.('sandbox')?.confine === 'function'), required: false },
+      'sandbox.policy': { status: has(() => typeof ctx.get?.('sandboxPolicy')?.resolve === 'function'), required: false },
+      'working_directory': { status: has(() => typeof ctx.get?.('workingDirectory')?.ensure === 'function'), required: true },
       'system_prompt.section': { status: has(() => typeof ctx.systemPrompt?.section === 'function'), required: false },
     };
 
@@ -2171,8 +2413,6 @@ export function apply(ctx, config) {
       degraded,
       caps: Object.fromEntries(Object.entries(caps).map(([k, c]) => [k, c.status])),
       requiredFlags: Object.fromEntries(Object.entries(caps).filter(([, c]) => c.required).map(([k]) => [k, true])),
-      // 探测时抛过的错误（0.2.4）：报 unsupported 时得能分清「没有这个服务」和「查询本身失败」。
-      ...(Object.keys(capErrors).length ? { capErrors } : {}),
     };
     // 日志直接序列化对象本身，避免手写字段名和对象字段名对不上（overallStatus vs status）。
     log(`compat: ${JSON.stringify(compatReport)}`);
@@ -2344,10 +2584,25 @@ export function apply(ctx, config) {
         // 现在记进「早到结算」缓冲区，绑定那一刻回放。
         // 只留一段短时间（10 分钟）的东西，不做持久化：这是竞态窗口，
         // 不是长期状态；过期就丢，由探活兜底处理。
-        earlyEnds.set(sid, { at: Date.now(), info: { stopReason: info?.stopReason } });
-        // 顺手清掉过期项，避免长期挂着
+        // 0.2.4：保留与实时路径一致的四个兜底字段（stopReason/status/reason/outcome），并做容量封顶防无限增长。
+        earlyEnds.set(sid, {
+          at: Date.now(),
+          info: {
+            stopReason: info?.stopReason,
+            status: info?.status,
+            reason: info?.reason,
+            outcome: info?.outcome,
+          },
+        });
+        // 顺手清掉过期项，并限制最大缓存量（200 条），避免短时间内高频非台账子代理撑大内存
+        const nowTs = Date.now();
         for (const [k, v] of earlyEnds) {
-          if (Date.now() - v.at > 10 * 60_000) earlyEnds.delete(k);
+          if (nowTs - v.at > 10 * 60_000) earlyEnds.delete(k);
+        }
+        while (earlyEnds.size > 200) {
+          const oldest = earlyEnds.keys().next().value;
+          if (oldest === undefined) break;
+          earlyEnds.delete(oldest);
         }
         log(`subagent/end 早于绑定到达（${sid}），已缓存，等 register_delegation 回放`);
         return;
@@ -2391,7 +2646,8 @@ export function apply(ctx, config) {
           completedAt: Date.now(),
         });
         emitEvent(null, t.id, terminal === 'succeeded' ? 'task.succeeded' : terminal === 'failed' ? 'task.failed' : 'task.cancelled', 'executor', String(detail ?? '').slice(0, 200));
-        settleNotification(null, { id: t.id, status: terminal, ownerSessionId: t.ownerSessionId, title: t.title }, { selfProduced: true });
+        // 0.2.4：原生 jobs settled 事件本身就会回到前台，与 subagent/end 保持一致，不再传 selfProduced: true 重复投递 followup。
+        settleNotification(null, { id: t.id, status: terminal, ownerSessionId: t.ownerSessionId, title: t.title });
         log(`结算：${t.id} → ${terminal}`);
       });
       if (typeof off === 'function') disposers.push(off);
@@ -2440,18 +2696,37 @@ export function apply(ctx, config) {
             gone = !getAgentHandle(ctx, t);
           } catch { gone = false; /* 探不动就别下结论 */ }
           if (gone) {
+            const errMsg = `已超 deadline（${LIMITS_READ().timeoutMinutes} 分钟），且原生 subagent 已不在`;
             d.updateTaskFields(t.id, {
               status: 'lost',
               currentStage: 'deadline-exceeded',
-              errorSummary: `已超 deadline（${LIMITS_READ().timeoutMinutes} 分钟），且原生 subagent 已不在`,
+              errorSummary: errMsg,
               updatedAt: Date.now(),
               completedAt: Date.now(),
             });
             emitEvent(null, t.id, 'task.lost', 'coordinator', 'deadline 超时 + 原生已回收');
-            settleNotification(null, { id: t.id, status: 'lost', ownerSessionId: t.ownerSessionId, title: t.title }, { selfProduced: true });
+            settleNotification(null, { id: t.id, status: 'lost', ownerSessionId: t.ownerSessionId, title: t.title, errorSummary: errMsg }, { selfProduced: true });
             changed += 1;
             continue;
           }
+        } else if (t.type === 'subagent' && !t.nativeSessionId && (!t.nativeId || t.status === 'cancel_requested')) {
+          // 0.2.4：未绑定（!nativeId）或「已绑定但未解析出会话 id 且已进入 cancel_requested」的超时 subagent，
+          // 既无法按 session id 探活、也收不到能匹配的 subagent/end；超时清账直接落 lost 并通知发起会话，
+          // 兑现 task_cancel 注释里「交给重启对账 / 超时清账收尾」的契约，不让任务永久卡死占配额。
+          const errMsg = !t.nativeId
+            ? `已超 deadline（${LIMITS_READ().timeoutMinutes} 分钟），且从未绑定原生 subagent`
+            : `已超 deadline（${LIMITS_READ().timeoutMinutes} 分钟），未解析出会话 id 且取消未获原生确认`;
+          d.updateTaskFields(t.id, {
+            status: 'lost',
+            currentStage: 'deadline-exceeded',
+            errorSummary: errMsg,
+            updatedAt: Date.now(),
+            completedAt: Date.now(),
+          });
+          emitEvent(null, t.id, 'task.lost', 'coordinator', !t.nativeId ? 'deadline 超时 + 从未绑定' : 'deadline 超时 + 无会话 id 无法确认');
+          settleNotification(null, { id: t.id, status: 'lost', ownerSessionId: t.ownerSessionId, title: t.title, errorSummary: errMsg }, { selfProduced: true });
+          changed += 1;
+          continue;
         }
 
         if (t.status !== 'cancel_requested') {
@@ -2512,6 +2787,10 @@ export function apply(ctx, config) {
     // 0.2.0：卸载时把库关掉（审计 P2-7）。
     // 以前 dispose() 只摘订阅和定时器，_sqlite 一直攥着句柄：
     // 插件重载会累积连接、-wal 永不 checkpoint、Windows 上库文件还被锁住。
+    // 0.2.4：卸载时兑现模块顶部注释，清掉 ACTIVE_CTX 与内存态缓存，不留悬挂引用。
+    if (ACTIVE_CTX === ctx) ACTIVE_CTX = null;
+    missStreak.clear();
+    earlyEnds.clear();
     try {
       if (_sqlite) {
         _sqlite.close();
@@ -2521,6 +2800,7 @@ export function apply(ctx, config) {
       log(`关库失败（不阻塞卸载）：${String(e).slice(0, 120)}`);
     } finally {
       _sqlite = null;
+      if (_log === log) _log = () => {};
     }
   };
 }
