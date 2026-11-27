@@ -533,6 +533,7 @@ const rm = (p) => { try { fs.rmSync(p, { recursive: true, force: true, maxRetrie
     await new Promise((res) => setTimeout(res, 300));
   } catch { crashed = true; }
   ok('8.3 垃圾配置不崩、不退化成 1ms 死循环', !crashed && typeof d2 === 'function');
+  if (typeof dispose === 'function') dispose();
   if (typeof d2 === 'function') d2();
   rm(home);
 }
@@ -1542,7 +1543,15 @@ const rm = (p) => { try { fs.rmSync(p, { recursive: true, force: true, maxRetrie
 
   const mod = await import(`${ROOT}/index.js?sec=sec24`);
 
-  // ---- 21.1 子进程 env 过滤（danger-full-access 与 sandbox.confine 两条分支均验证） ----
+  // ---- 21.1 子进程 env 过滤（danger-full-access 与 sandbox.confine 两条分支均验证；跨平台带空格路径） ----
+  const envProbeDir = path.join(home, 'env probe');
+  fs.mkdirSync(envProbeDir, { recursive: true });
+  const envProbeFile = path.join(envProbeDir, 'dump.cjs');
+  fs.writeFileSync(
+    envProbeFile,
+    'console.log(JSON.stringify({k:process.env.DEEPSEEK_API_KEY||null,t:process.env.GITHUB_TOKEN||null,p:process.env.DB_PASSWORD||null,d:process.env.DSH_INTERNAL_SECRET_TEST||null,s:process.env.SAFE_COORDINATOR_KEEP||null,sb:process.env.SANDBOX_INJECTED||null}));\n',
+    'utf8',
+  );
   for (const [tag, mode] of [['21.1a', 'danger-full-access'], ['21.1b', 'workspace-write']]) {
     const R = {};
     const outChunks = [];
@@ -1567,32 +1576,16 @@ const rm = (p) => { try { fs.rmSync(p, { recursive: true, force: true, maxRetrie
       workingDirectory: { ensure: async () => process.cwd() },
       sandboxPolicy: { resolve: async () => ({ mode }) },
       sandbox: {
-        confine: async (argv) => ({ argv, env: { SANDBOX_INJECTED: 'from-sandbox' } }),
+        // 真实沙箱包装器返回的是直接可执行的 argv（同 11.1），而不是把 cmd.exe 原样透传给 verbatim=false
+        confine: async () => ({ argv: [process.execPath, envProbeFile], env: { SANDBOX_INJECTED: 'from-sandbox' } }),
       },
       tools: { register(t) { R[t.name] = t; } },
       on() { return () => {}; },
     });
     const dispose = mod.default.apply(ctx, { global: 20, perOwner: 20, timeoutMinutes: 120, sweepSeconds: 600, retentionDays: 30 });
     const ex = { agent: { id: `owner-${tag}`, session: { id: `owner-${tag}` } } };
-    const probeScript = 'console.log(JSON.stringify({k:process.env.DEEPSEEK_API_KEY||null,t:process.env.GITHUB_TOKEN||null,p:process.env.DB_PASSWORD||null,d:process.env.DSH_INTERNAL_SECRET_TEST||null,s:process.env.SAFE_COORDINATOR_KEEP||null,sb:process.env.SANDBOX_INJECTED||null}))';
-    // 0.2.5：命令构造按平台分支。
-    // 原写法 `"${execPath}" -e "${script}"` 在 Linux 上没问题（bash 会剥引号），
-    // 但 Windows 走 cmd /d /s /c + windowsVerbatimArguments，引号会变成字面量
-    // （正是 0.2.0 修过的坑）。
-    //
-    // 而 `process.execPath` 在这台机器上是 `C:\Program Files\DSH NEXT\...\node.exe`——
-    // 不加引号会被空格劈开，加引号又变字面量。两头堵。
-    // 解法：Windows 上改用 PATH 里的 node（无空格）+ 临时脚本文件。
-    let cmd;
-    if (process.platform === 'win32') {
-      const scriptDir = fs.mkdtempSync(path.join(os.tmpdir(), 'envprobe-'));
-      const scriptFile = path.join(scriptDir, 'probe.cjs');
-      fs.writeFileSync(scriptFile, `${probeScript}\n`, 'utf8');
-      // 用裸 `node`（PATH 解析），路径也只有 tmpdir 一段，都不含空格
-      cmd = `node ${scriptFile}`;
-    } else {
-      cmd = `"${process.execPath}" -e "${probeScript.replace(/"/g, '\\"')}"`;
-    }
+    // 首尾均为引号 + 带空格路径：同时覆盖 Windows cmd.exe /d /s /c 首尾引号剥离修复与跨平台脚本执行
+    const cmd = `"${process.execPath}" "${envProbeFile}"`;
     await R.task_create.execute({ type: 'job', title: `env-${tag}`, objective: cmd }, ex);
     if (jobDone) await jobDone;
     dispose();
@@ -1601,7 +1594,7 @@ const rm = (p) => { try { fs.rmSync(p, { recursive: true, force: true, maxRetrie
     try { parsed = JSON.parse(joined.split(/\r?\n/).pop()); } catch { /* ignore */ }
     const noLeaks = parsed && parsed.k === null && parsed.t === null && parsed.p === null && parsed.d === null && parsed.s === 'safe-keep-val';
     const sbOk = mode === 'workspace-write' ? parsed?.sb === 'from-sandbox' : true;
-    ok(`${tag} 子进程过滤宿主凭据与 DSH_*（${mode}）`, !!(noLeaks && sbOk), joined.slice(0, 120));
+    ok(`${tag} 子进程过滤宿主凭据与 DSH_*（${mode}，含带空格引号路径）`, !!(noLeaks && sbOk), joined.slice(0, 120));
   }
 
   // ---- 21.2 首次绑定验证子代理父子归属 ----
@@ -1910,6 +1903,102 @@ const rm = (p) => { try { fs.rmSync(p, { recursive: true, force: true, maxRetrie
     disposeR();
   }
 
+  // ---- 21.5 基线合入与边界强化（config.profile / resolveSubagentBinding 降级边界 / toTaskHandle / cmd 引号） ----
+  {
+    const prevPDir = process.env.DSH_PROFILE_DIR;
+    const prevP = process.env.DSH_PROFILE;
+    const prevPName = process.env.DSH_PROFILE_NAME;
+    delete process.env.DSH_PROFILE_DIR;
+    delete process.env.DSH_PROFILE;
+    delete process.env.DSH_PROFILE_NAME;
+
+    // 21.5a env 全空时，config.profile 生效并打印来源 config.profile
+    const logsA = [];
+    const RA = {};
+    const mkP = (logs, toolsMap, extra = {}) => mkCtx({
+      logger: { info: (m) => logs.push(m) },
+      jobs: { start() { return 'nj'; }, get() { return { status: 'running' }; }, readAt() { return { chunks: [] }; }, kill() { return 'requested'; }, events: { subscribe() { return () => {}; } } },
+      agents: { get() { return undefined; } },
+      workingDirectory: { ensure: async () => process.cwd() },
+      sandboxPolicy: { resolve: async () => ({ mode: 'danger-full-access' }) },
+      sandbox: { confine: async (a) => ({ argv: a }) },
+      tools: { register(t) { toolsMap[t.name] = t; } },
+      on() { return () => {}; },
+      ...extra,
+    });
+    const dDesk = mod.default.apply(mkP(logsA, RA), { profile: 'desktop', sweepSeconds: 600 });
+    await RA.task_create.execute({ type: 'subagent', title: 'desk-task', objective: 'x' }, { agent: { id: 'o-d', session: { id: 'o-d' } } });
+    const deskLog = logsA.find((l) => l.includes('台账目录：')) ?? '';
+    // 0.2.5：不要用 path.join(home, ...) 猜路径 —— dataDir 走 os.homedir()，
+    // 而测试改的是 USERPROFILE/HOME 环境变量，两者在当前 Node 上不一定同步。
+    // 直接从日志里把实际路径抠出来验，那才是插件真正用的。
+    const deskPathMatch = deskLog.match(/台账目录：(.+?)（来源/);
+    const deskDb = deskPathMatch ? path.join(deskPathMatch[1], 'tasks.db') : null;
+    ok('21.5a env 全空时 config.profile 生效并落到 desktop/tasks.db',
+      deskLog.includes('desktop') && deskLog.includes('来源：config.profile')
+        && !!deskDb && fs.existsSync(deskDb),
+      deskLog.slice(0, 90));
+    dDesk();
+
+    // 21.5b config.profile / config.profileName 优先级高于环境变量
+    process.env.DSH_PROFILE_DIR = path.join(home, '.dsh', 'profiles', 'envwin');
+    const logsB = [];
+    const RB = {};
+    const dAlias = mod.default.apply(mkP(logsB, RB), { profileName: 'fromcfg', sweepSeconds: 600 });
+    const aliasLog = logsB.find((l) => l.includes('台账目录：')) ?? '';
+    ok('21.5b config.profileName 优先级高于 DSH_PROFILE_DIR',
+      aliasLog.includes('fromcfg') && aliasLog.includes('来源：config.profile'),
+      aliasLog.slice(0, 90));
+    dAlias();
+
+    // 21.5c resolveSubagentBinding 边界：
+    //   ① 宿主无 subagents 服务 → 不误拒正常绑定；
+    //   ② listChildren 已裁剪（返回空）但 sessions.get 正向证明父会话一致 → 允许绑定；
+    //   ③ listChildren 返回空且 sessions.get 显示属于其他父会话 → 仍拒绝绑定。
+    process.env.DSH_PROFILE_DIR = path.join(home, '.dsh', 'profiles', 'bindedge');
+    const RNoSub = {};
+    const dNoSub = mod.default.apply(mkP([], RNoSub), { sweepSeconds: 600 });
+    const exA = { agent: { id: 'owner-edgeA', session: { id: 'owner-edgeA' } } };
+    const exB = { agent: { id: 'owner-edgeB', session: { id: 'owner-edgeB' } } };
+    const r0 = await RNoSub.task_create.execute({ type: 'subagent', title: 'nosub', objective: 'x' }, exA);
+    const t0 = r0.text.match(/taskId=([\w-]+)/)?.[1];
+    const b0 = await RNoSub.task_register_delegation.execute({ taskId: t0, agentId: 'ag0', sessionId: 'sess-nosub-1' }, exA);
+    dNoSub();
+
+    const RPruned = {};
+    const dPruned = mod.default.apply(mkP([], RPruned, {
+      subagents: { async listChildren() { return []; } }, // 模拟已结束子代理被移出 listChildren
+      sessions: {
+        get(id) {
+          if (id === 'sess-pruned-A') return { header: { parentId: 'owner-edgeA' } };
+          return undefined;
+        },
+      },
+    }), { sweepSeconds: 600 });
+    const r1 = await RPruned.task_create.execute({ type: 'subagent', title: 'prunedA', objective: 'x' }, exA);
+    const t1 = r1.text.match(/taskId=([\w-]+)/)?.[1];
+    const b1 = await RPruned.task_register_delegation.execute({ taskId: t1, agentId: 'ag1', sessionId: 'sess-pruned-A' }, exA);
+    const r2 = await RPruned.task_create.execute({ type: 'subagent', title: 'prunedB', objective: 'x' }, exB);
+    const t2 = r2.text.match(/taskId=([\w-]+)/)?.[1];
+    const b2 = await RPruned.task_register_delegation.execute({ taskId: t2, agentId: 'ag2', sessionId: 'sess-pruned-A' }, exB);
+    dPruned();
+
+    ok('21.5c resolveSubagentBinding 边界：无 subagents 不误拒、元数据正向确权可容忍 listChildren 裁剪、跨会话仍拒绝',
+      b0.ok && b1.ok && !b2.ok && b2.text.includes('拒绝绑定'),
+      `noSub=${b0.ok} prunedSelf=${b1.ok} prunedOther=${b2.ok}`);
+
+    // 21.5d toTaskHandle 含 ownerSessionId + win32 danger-full-access cmd.exe 外层双引号保护
+    const idxSrc = fs.readFileSync(new URL('../index.js', import.meta.url), 'utf8');
+    ok('21.5d toTaskHandle 补齐 ownerSessionId 且 win32 cmd /d /s /c 带外层引号保护',
+      /ownerSessionId:\s*row\.ownerSessionId\s*\?\?\s*null/.test(idxSrc)
+        && /\['cmd\.exe',\s*'\/d',\s*'\/s',\s*'\/c',\s*`"\$\{firstLine\}"`\]/.test(idxSrc),
+      'checked');
+
+    if (prevPDir === undefined) delete process.env.DSH_PROFILE_DIR; else process.env.DSH_PROFILE_DIR = prevPDir;
+    if (prevP === undefined) delete process.env.DSH_PROFILE; else process.env.DSH_PROFILE = prevP;
+    if (prevPName === undefined) delete process.env.DSH_PROFILE_NAME; else process.env.DSH_PROFILE_NAME = prevPName;
+  }
+
   const restore = (k, v) => { if (v === undefined) delete process.env[k]; else process.env[k] = v; };
   restore('USERPROFILE', saved.U);
   restore('HOME', saved.H);
@@ -1924,62 +2013,13 @@ const rm = (p) => { try { fs.rmSync(p, { recursive: true, force: true, maxRetrie
 }
 
 // ---------------------------------------------------------------------------
-// 22. 0.2.5 融合：config.profile 仍是第一来源（Gemini 版把它删了，本机必需）
+// 22. 0.2.5 融合保留项：v2 库能迁到 v3，且约束真的生效
+//     （Gemini 版没有这条完整断言，只有一处零散的 REFERENCES 提及）
 // ---------------------------------------------------------------------------
 {
-  // 从 index.js 里把 dataDir 抠出来做纯函数测试（不启插件，不受宿主影响）
-  const src = fs.readFileSync(new URL('../index.js', import.meta.url), 'utf8');
-  const s0 = src.indexOf('function dataDir(configHint) {');
-  const s1 = src.indexOf('function dbPath(configHint) {');
-  if (s0 < 0 || s1 < 0) throw new Error('dataDir(configHint) 未找到——融合没保住这条');
-  const HOME_DATA = path.join(os.homedir(), '.dsh', 'background-task-coordinator');
-  const mkDataDir = new Function('path', 'os', 'createHash', 'HOME_DATA',
-    src.slice(s0, s1) + '; return dataDir;')(path, os, createHash, HOME_DATA);
-
-  const savedEnv = { D: process.env.DSH_PROFILE_DIR, P: process.env.DSH_PROFILE, H: process.env.DSH_HOME };
-  // 模拟「插件进程里读不到环境变量」——这台机器的实测情况
-  delete process.env.DSH_PROFILE_DIR;
-  delete process.env.DSH_PROFILE;
-  delete process.env.DSH_HOME;
-
-  const b = (p) => path.basename(p);
-
-  ok('22.1 config.profile 生效（env 为空时）', b(mkDataDir({ profile: 'desktop' })) === 'desktop', b(mkDataDir({ profile: 'desktop' })));
-  ok('22.2 profileName 也认', b(mkDataDir({ profileName: 'mytest' })) === 'mytest');
-  ok('22.3 都没有时退回 default（0.2.3 的 bug 现场）', b(mkDataDir({})) === 'default', b(mkDataDir({})));
-
-  // 22.4 Gemini 的路径碰撞检测要保住：不同根目录下的同名 profile 不能共库
-  const same1 = mkDataDir({ profile: 'default' });
-  ok('22.4 config 给的纯名字不加指纹（向后兼容）', b(same1) === 'default', b(same1));
-  // 完整路径形态：非标准根目录 → 带指纹
-  const weird = path.join(os.homedir(), 'elsewhere', 'profiles', 'default');
-  const weirdDir = mkDataDir({ profile: weird });
-  ok('22.5 config 给非标准路径时加指纹（不串库）', b(weirdDir).startsWith('default-'), b(weirdDir));
-
-  // 22.6 config 优先于 env（两个都有时用 config）
-  process.env.DSH_PROFILE_DIR = path.join(os.homedir(), '.dsh', 'profiles', 'fromenv');
-  ok('22.6 config 压过 env', b(mkDataDir({ profile: 'fromconfig' })) === 'fromconfig', b(mkDataDir({ profile: 'fromconfig' })));
-  // 22.7 没 config 时 env 兜底（Gemini 那边的原始行为）
-  ok('22.7 无 config 时 env 兜底', b(mkDataDir({})) === 'fromenv', b(mkDataDir({})));
-
-  if (savedEnv.D !== undefined) process.env.DSH_PROFILE_DIR = savedEnv.D; else delete process.env.DSH_PROFILE_DIR;
-  if (savedEnv.P !== undefined) process.env.DSH_PROFILE = savedEnv.P; else delete process.env.DSH_PROFILE;
-  if (savedEnv.H !== undefined) process.env.DSH_HOME = savedEnv.H; else delete process.env.DSH_HOME;
-
-  // 22.8 profile 配置里确实写了 profile（运行时那份不是仓库这份，但仓库这份是打包源）
-  const yml = fs.readFileSync(new URL('../cordis.patch.yml', import.meta.url), 'utf8');
-  ok('22.8 cordis.patch.yml 里有 profile', /^\s+profile:\s*\S+/m.test(yml),
-    (yml.match(/profile:.*/) ?? ['(无)'])[0].trim());
-}
-
-// ---------------------------------------------------------------------------
-// 23. 0.2.5：v2 库能迁到 v3，且约束真的生效（Gemini 版没有这条）
-// ---------------------------------------------------------------------------
-{
-  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'v025-mig-'));
-  const oldDb = path.join(home, 'tasks.db');
+  const migHome = fs.mkdtempSync(path.join(os.tmpdir(), 'v025-mig-'));
+  const oldDb = path.join(migHome, 'tasks.db');
   {
-    const { DatabaseSync } = await import('node:sqlite');
     const w = new DatabaseSync(oldDb);
     w.exec(`
       CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -1998,36 +2038,89 @@ const rm = (p) => { try { fs.rmSync(p, { recursive: true, force: true, maxRetrie
       CREATE UNIQUE INDEX uq_messages_task_key ON task_messages(task_id, idempotency_key);
     `);
     w.prepare("INSERT INTO meta VALUES (?,?)").run('schema.task_messages.unique', '2');
-    w.prepare("INSERT INTO tasks (id,conversation_id,owner_session_id,type,title,objective,status,priority,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)")
-      .run('t1', 'c', 's', 'job', 'x', 'echo', 'succeeded', 5, 1, 1);
+    w.prepare("INSERT INTO tasks (id,conversation_id,owner_session_id,type,title,objective,status,priority,created_at,updated_at,labels) VALUES (?,?,?,?,?,?,?,?,?,?,?)")
+      .run('t1', 'c', 's', 'job', 'x', 'echo', 'succeeded', 5, 1, 1, null);
     w.prepare("INSERT INTO task_messages (message_id,task_id,sender,content,idempotency_key,status,created_at) VALUES (?,?,?,?,?,?,?)")
       .run('m1', 't1', 'user', 'hi', 'k1', 'delivered', 1);
     w.close();
   }
 
   const { CoordinatorDatabase } = await import(`${ROOT}/lib/storage/database.js`);
-  const db = new CoordinatorDatabase(oldDb);
-  const msql = db.db.prepare("SELECT sql FROM sqlite_master WHERE name='task_messages'").get().sql;
-  const v = db.db.prepare("SELECT value FROM meta WHERE key='schema.task_messages.unique'").get()?.value;
-  ok('23.1 v2 → v3 版本推进', Number(v) === 3, `v=${v}`);
-  ok('23.2 迁移后补上了外键', /REFERENCES\s+tasks/i.test(msql));
-  ok('23.3 迁移后补上了 CHECK', /CHECK\s*\(\s*status/i.test(msql));
-  ok('23.4 老数据保留', db.stats().messages === 1 && db.stats().tasks === 1, JSON.stringify(db.stats()));
+  const mdb = new CoordinatorDatabase(oldDb);
+  const msql = mdb.db.prepare("SELECT sql FROM sqlite_master WHERE name='task_messages'").get().sql;
+  const mv = mdb.db.prepare("SELECT value FROM meta WHERE key='schema.task_messages.unique'").get()?.value;
+  ok('22.1 v2 → v3 版本推进', Number(mv) === 3, `v=${mv}`);
+  ok('22.2 迁移后补上外键', /REFERENCES\s+tasks/i.test(msql));
+  ok('22.3 迁移后补上 CHECK', /CHECK\s*\(\s*status/i.test(msql));
+  ok('22.4 老数据保留', mdb.stats().messages === 1 && mdb.stats().tasks === 1, JSON.stringify(mdb.stats()));
 
   let fkBlocked = false;
   try {
-    db.db.prepare("INSERT INTO task_messages (message_id,task_id,sender,content,idempotency_key,status,created_at) VALUES (?,?,?,?,?,?,?)")
+    mdb.db.prepare("INSERT INTO task_messages (message_id,task_id,sender,content,idempotency_key,status,created_at) VALUES (?,?,?,?,?,?,?)")
       .run('orphan', 'nope', 'user', 'x', 'k9', 'pending', 1);
   } catch { fkBlocked = true; }
   let ckBlocked = false;
   try {
-    db.db.prepare("INSERT INTO task_messages (message_id,task_id,sender,content,idempotency_key,status,created_at) VALUES (?,?,?,?,?,?,?)")
+    mdb.db.prepare("INSERT INTO task_messages (message_id,task_id,sender,content,idempotency_key,status,created_at) VALUES (?,?,?,?,?,?,?)")
       .run('bad', 't1', 'user', 'x', 'k10', 'BOGUS', 1);
   } catch { ckBlocked = true; }
-  ok('23.5 孤儿消息插不进去', fkBlocked);
-  ok('23.6 非法 status 插不进去', ckBlocked);
-  db.close();
-  try { fs.rmSync(home, { recursive: true, force: true, maxRetries: 3 }); } catch {}
+  ok('22.5 孤儿消息插不进去', fkBlocked);
+  ok('22.6 非法 status 插不进去', ckBlocked);
+  mdb.close();
+  try { fs.rmSync(migHome, { recursive: true, force: true, maxRetries: 3 }); } catch {}
+}
+
+// ---------------------------------------------------------------------------
+// 23. 0.2.5 融合保留项：config.profile 的路径指纹（与 Gemini 的实现对齐）
+// ---------------------------------------------------------------------------
+{
+  const src = fs.readFileSync(new URL('../index.js', import.meta.url), 'utf8');
+  const s0 = src.indexOf('function resolveDataDir(configHint) {');
+  const s1 = src.indexOf('function dataDir(configHint) {');
+  if (s0 < 0 || s1 < 0) throw new Error('resolveDataDir 未找到');
+  const mkResolve = new Function(
+    'path', 'os', 'createHash', 'home', 'baseRoot', 'sanitize', 'shortHash', 'samePath',
+    src.slice(s0, s1) + '; return resolveDataDir;',
+  );
+  // 复刻它内部的四个闭包依赖
+  const home = os.homedir();
+  const baseRoot = path.join(home, '.dsh', 'background-task-coordinator');
+  const sanitize = (s) => s.replace(/[\\/:*?"<>|\u0000-\u001f]/g, '_').slice(0, 48) || 'default';
+  const shortHash = (p) => {
+    const norm = process.platform === 'win32' ? p.toLowerCase() : p;
+    return createHash('sha256').update(norm).digest('hex').slice(0, 8);
+  };
+  const samePath = (a, b) => (process.platform === 'win32' ? a.toLowerCase() === b.toLowerCase() : a === b);
+  const resolveDataDir = mkResolve(path, os, createHash, home, baseRoot, sanitize, shortHash, samePath);
+
+  const saved = { D: process.env.DSH_PROFILE_DIR, P: process.env.DSH_PROFILE, N: process.env.DSH_PROFILE_NAME, H: process.env.DSH_HOME };
+  delete process.env.DSH_PROFILE_DIR; delete process.env.DSH_PROFILE;
+  delete process.env.DSH_PROFILE_NAME; delete process.env.DSH_HOME;
+
+  const r1 = resolveDataDir({ profile: 'desktop' });
+  ok('23.1 config.profile 生效且报对来源', r1.source === 'config.profile' && path.basename(r1.dir) === 'desktop',
+    `${r1.source} → ${path.basename(r1.dir)}`);
+
+  const r2 = resolveDataDir({ profileName: 'alias' });
+  ok('23.2 profileName 也认', r2.source === 'config.profile' && path.basename(r2.dir) === 'alias');
+
+  const r3 = resolveDataDir({});
+  ok('23.3 env 全空时退回 default', path.basename(r3.dir) === 'default', path.basename(r3.dir));
+
+  // 名字需清洗 → 带指纹（不串库）
+  const r4 = resolveDataDir({ profile: 'a b/c' });
+  ok('23.4 需清洗的名字加指纹', path.basename(r4.dir).startsWith('a_b_c-'), path.basename(r4.dir));
+
+  // env 兜底（Gemini 那边的原始能力）
+  process.env.DSH_PROFILE_DIR = path.join(home, '.dsh', 'profiles', 'fromenv');
+  const r5 = resolveDataDir({});
+  ok('23.5 无 config 时 env 兜底', path.basename(r5.dir) === 'fromenv' && r5.source === 'env.DSH_PROFILE_DIR',
+    `${r5.source} → ${path.basename(r5.dir)}`);
+
+  if (saved.D !== undefined) process.env.DSH_PROFILE_DIR = saved.D; else delete process.env.DSH_PROFILE_DIR;
+  if (saved.P !== undefined) process.env.DSH_PROFILE = saved.P; else delete process.env.DSH_PROFILE;
+  if (saved.N !== undefined) process.env.DSH_PROFILE_NAME = saved.N; else delete process.env.DSH_PROFILE_NAME;
+  if (saved.H !== undefined) process.env.DSH_HOME = saved.H; else delete process.env.DSH_HOME;
 }
 
 console.log('=== 0.2.0 专项 ===');

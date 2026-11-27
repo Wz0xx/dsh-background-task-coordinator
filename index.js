@@ -48,25 +48,26 @@ const PROMPT_TEXT = `## 后台任务
 伙伴说了「放后台」就直接建，不用问要不要；他没说但这件事明显要跑很久，建完告他一声就行。任务结束会自己回来告诉结果，不用一直盯着查。`;
 
 /**
- * 台账库路径（0.2.0 按 profile 隔离；0.2.4 防同名 profile 路径碰撞）。
+ * 台账库路径（0.2.0 按 profile 隔离；0.2.4 合并 config.profile 支持与防同名 profile 路径碰撞）。
  *
- * 以前所有 profile 写同一个 `~/.dsh/background-task-coordinator/tasks.db`（审计 P2-7）；
- * 0.2.0–0.2.3 仅取 `DSH_PROFILE_DIR` 的 basename，若两套不同根目录/不同 world 下存在
- * 同名 profile（例如两个不同目录的 `default`），仍会共用同一个 tasks.db 并互相标 lost。
- *
- * 0.2.4 规则（Gemini 版）：非默认根目录 / 名字需清洗时加 8 位路径指纹，避免同名串库。
- *
- * 0.2.5 融合（本机必需）：把 `config.profile` 重新接成**第一来源**。
- *   Gemini 版只认环境变量，因为他的 Linux 部署里环境变量能传进插件进程；
- *   本机实测传不进来（日志原文：数据目录 ...\background-task-coordinator\default），
- *   只靠环境变量会落回 default\，和真数据（desktop\）再次分家。
- *   现在：config.profile → env.DSH_PROFILE_DIR → env.DSH_PROFILE → default，
- *   且 config 来的名字**同样**参与指纹计算（两个不同 profile 同名时也不会撞）。
+ * 优先级（与 DSH host 子进程读不到环境变量的真机实测对齐）：
+ *   ① `config.profile` / `config.profileName`（cordis.patch.yml 显式配置，最稳）；
+ *   ② `process.env.DSH_PROFILE_DIR`（位于默认 `~/.dsh/profiles/<cleanName>` 且目录名未清洗截断时沿用 `<cleanName>`；
+ *      其他根目录/world 或清洗截断后的名字附带 8 位 SHA-256 路径指纹 `<cleanName>-<hash8>`，避免同名 profile 串库）；
+ *   ③ `process.env.DSH_PROFILE` / `process.env.DSH_PROFILE_NAME`（配非默认 `DSH_HOME` 时同样带指纹）；
+ *   ④ `default`（兜底）。
  */
-function dataDir(configHint) {
+let ACTIVE_PROFILE_HINT = null;
+
+function resolveDataDir(configHint) {
+  const hint = configHint !== undefined ? configHint : ACTIVE_PROFILE_HINT;
   const home = os.homedir();
   const baseRoot = path.join(home, '.dsh', 'background-task-coordinator');
-  const sanitize = (s) => s.replace(/[\\/:*?"<>|\u0000-\u001f]/g, '_').slice(0, 48) || 'default';
+  // 0.2.5 补：把空格也清洗掉。
+  // 原正则只挡 `\/:*?"<>|` 和控制字符，空格能过 —— 于是 profile 名为 `my profile`
+  // 时会生成带空格的目录名，在 shell / 命令行工具里要一路加引号，很容易踩坑。
+  // 连带效果：名字被清洗过就走 fingerprint 分支，两个不同原名不会撞同一目录。
+  const sanitize = (s) => s.replace(/[\\/:*?"<>|\s\u0000-\u001f]/g, '_').slice(0, 48) || 'default';
   const shortHash = (p) => {
     const norm = process.platform === 'win32' ? p.toLowerCase() : p;
     return createHash('sha256').update(norm).digest('hex').slice(0, 8);
@@ -74,35 +75,25 @@ function dataDir(configHint) {
   const samePath = (a, b) => (process.platform === 'win32'
     ? a.toLowerCase() === b.toLowerCase()
     : a === b);
+  const dshHome = String(process.env.DSH_HOME ?? '').trim();
+  const nonStdHome = (() => {
+    if (!dshHome) return null;
+    const resolvedHome = path.resolve(dshHome);
+    const stdHome = path.resolve(home, '.dsh');
+    return samePath(resolvedHome, stdHome) ? null : resolvedHome;
+  })();
 
-  // ① config.profile（0.2.5 融合）：宿主通过 patch 配置传进来的 profile 名。
-  // 它可能是完整路径，也可能只是一个名字 —— 两种都处理。
-  const fromConfig = String(
-    (configHint && typeof configHint === 'object'
-      ? (configHint.profile ?? configHint.profileName)
-      : '') ?? '',
-  ).trim();
+  // ① config.profile / config.profileName（最高优先级，解决 host 子进程读不到 DSH_PROFILE* 环境变量）
+  const fromConfig = String(hint?.profile ?? hint?.profileName ?? '').trim();
   if (fromConfig) {
-    // 看起来像路径（含分隔符）就按路径走，否则当纯名字。
-    const looksLikePath = /[\\/]/.test(fromConfig);
-    if (looksLikePath) {
-      const resolved = path.resolve(fromConfig.replace(/[\\/]+$/, ''));
-      const base = path.basename(resolved);
-      const name = sanitize(base);
-      const stdProfilesRoot = path.resolve(home, '.dsh', 'profiles');
-      if (samePath(path.dirname(resolved), stdProfilesRoot) && base === name) {
-        return path.join(baseRoot, name);
-      }
-      return path.join(baseRoot, `${name}-${shortHash(resolved)}`);
-    }
-    const name = sanitize(fromConfig);
-    // 名字被清洗/截断过 → 加指纹，避免两个不同名字映射到同一个目录
-    if (name !== fromConfig) {
-      return path.join(baseRoot, `${name}-${shortHash(fromConfig)}`);
-    }
-    return path.join(baseRoot, name);
+    const tag = sanitize(fromConfig);
+    const dir = (nonStdHome || fromConfig !== tag)
+      ? path.join(baseRoot, `${tag}-${shortHash(`${nonStdHome ?? ''}\0${fromConfig}`)}`)
+      : path.join(baseRoot, tag);
+    return { dir, source: 'config.profile' };
   }
 
+  // ② env.DSH_PROFILE_DIR（带非默认根目录 8 位指纹，防不同目录下同名 profile 串库）
   const raw = String(process.env.DSH_PROFILE_DIR ?? '').trim();
   if (raw) {
     const cleaned = raw.replace(/[\\/]+$/, '');
@@ -110,25 +101,31 @@ function dataDir(configHint) {
     const base = path.basename(resolved);
     const name = sanitize(base);
     const stdProfilesRoot = path.resolve(home, '.dsh', 'profiles');
-    if (samePath(path.dirname(resolved), stdProfilesRoot) && base === name) {
-      return path.join(baseRoot, name);
-    }
-    return path.join(baseRoot, `${name}-${shortHash(resolved)}`);
+    const dir = (samePath(path.dirname(resolved), stdProfilesRoot) && base === name)
+      ? path.join(baseRoot, name)
+      : path.join(baseRoot, `${name}-${shortHash(resolved)}`);
+    return { dir, source: 'env.DSH_PROFILE_DIR' };
   }
 
+  // ③ env.DSH_PROFILE / env.DSH_PROFILE_NAME
   const envName = String(process.env.DSH_PROFILE ?? process.env.DSH_PROFILE_NAME ?? '').trim();
-  const tag = sanitize(envName);
-  const dshHome = String(process.env.DSH_HOME ?? '').trim();
-  if (dshHome) {
-    const resolvedHome = path.resolve(dshHome);
-    const stdHome = path.resolve(home, '.dsh');
-    if (!samePath(resolvedHome, stdHome) || (envName && envName !== tag)) {
-      return path.join(baseRoot, `${tag}-${shortHash(`${resolvedHome}\0${envName}`)}`);
-    }
-  } else if (envName && envName !== tag) {
-    return path.join(baseRoot, `${tag}-${shortHash(envName)}`);
+  if (envName) {
+    const tag = sanitize(envName);
+    const dir = (nonStdHome || envName !== tag)
+      ? path.join(baseRoot, `${tag}-${shortHash(`${nonStdHome ?? ''}\0${envName}`)}`)
+      : path.join(baseRoot, tag);
+    return { dir, source: 'env.DSH_PROFILE' };
   }
-  return path.join(baseRoot, tag);
+
+  // ④ fallback(default)
+  const dir = nonStdHome
+    ? path.join(baseRoot, `default-${shortHash(nonStdHome)}`)
+    : path.join(baseRoot, 'default');
+  return { dir, source: 'fallback(default)' };
+}
+
+function dataDir(configHint) {
+  return resolveDataDir(configHint).dir;
 }
 
 function dbPath(configHint) {
@@ -281,25 +278,21 @@ function makeChunkDecoder() {
 // 台账存储：SQLite（node:sqlite，宿主 Node v24.21.0 内置稳定）。
 // schema/存储层来自 src/storage 编译产物 lib/storage/database.js——23/23 单测全绿那套。
 // 状态真源是 DSH 原生 Agent/Job，SQLite 只是更耐用的投影载体（坏了删 tasks.db 重建）。
-// 旧 tasks.json 首次启动时一次性迁移进来，迁完改名 .migrated 保留。
+// 旧 tasks.json 首次启动时一次性脱敏迁移进来，checkpoint 后删除源文件并清理历史 .migrated。
 // ---------------------------------------------------------------------------
 import { CoordinatorDatabase } from './lib/storage/database.js';
 
 let _sqlite = null; // CoordinatorDatabase 单例
+let ACTIVE_DB_PATH = null; // 0.2.4：apply() 时锁定本次实例的库路径，防止运行期 env 变动导致中途切库
 // 模块级日志钩子：apply() 时注入，供 migrate 等模块级函数使用
 let _log = () => {};
 // 模块级 ctx 引用：settleNotification 这类模块级函数要给发起会话投消息，
 // 需要 agents 服务。apply() 时注入，dispose 时清掉（不留悬挂引用）。
 let ACTIVE_CTX = null;
-// 模块级 profile 提示（0.2.5 融合）：apply(config) 时从宿主配置取，db()/dataDir() 要用。
-// 为什么必须留：本机插件进程读不到 DSH_PROFILE_DIR（宿主没传给 host 子进程），
-// 只靠环境变量会一直落到 default/。Gemini 版删掉了这条，他的 Linux 环境用不上，
-// 但这台机器必需。
-let _profileHint = '';
 
 function db() {
   if (!_sqlite) {
-    _sqlite = new CoordinatorDatabase(dbPath({ profile: _profileHint }));
+    _sqlite = new CoordinatorDatabase(ACTIVE_DB_PATH || dbPath());
     migrateJsonFileIfNeeded();
   }
   return _sqlite;
@@ -307,7 +300,7 @@ function db() {
 
 /** 旧 tasks.json → SQLite 一次性迁移（0.2.4：脱敏迁入、落盘后删除源明文副本并清理历史 .migrated）。 */
 function migrateJsonFileIfNeeded() {
-  const dir = dataDir({ profile: _profileHint });
+  const dir = ACTIVE_DB_PATH ? path.dirname(ACTIVE_DB_PATH) : dataDir();
   // 0.2.4：如果此前旧版本（0.1.x–0.2.3）迁移后留下了 tasks.json.migrated 明文副本，
   // 既然 SQLite 已成功打开，就清掉这份不受 retentionDays 管理的明文残留。
   const legacyCopy = path.join(dir, 'tasks.json.migrated');
@@ -434,6 +427,8 @@ function toTaskHandle(row) {
   return {
     id: row.id,
     conversationId: row.conversationId ?? null,
+    // 0.2.4：补齐 ownerSessionId，避免调用方拿 task handle 时漏掉归属会话 id。
+    ownerSessionId: row.ownerSessionId ?? null,
     type: row.type === 'subagent' ? 'subagent' : 'job',
     title: row.title ?? null,
     objective: row.objective ?? null,
@@ -624,21 +619,15 @@ export function apply(ctx, config) {
   const log = (msg) => logger?.info?.(`[task-coordinator] ${msg}`);
   _log = log; // 模块级函数（migrate 等）也要能打日志
   ACTIVE_CTX = ctx;   // settleNotification 要给发起会话投消息，需要 agents 服务
-  // profile 提示（0.2.5 融合）：宿主在启动参数里给了 {"profile":"desktop"}，
-  // 但没通过环境变量传给插件进程 —— 所以必须从 config 取。
-  _profileHint = String(
-    (PLUGIN_CFG.profile ?? PLUGIN_CFG.profileName ?? '') || '',
-  ).trim();
-  // 打出实际用到的目录与来源：这一行是排查「数据落到 default/」的唯一线索。
-  // 上一轮我改错了文件（改的是仓库里那份 cordis.patch.yml，运行时读的是 profile 里那份），
-  // 就是靠这行 `来源：fallback(default)` 当场暴露的。
-  {
-    const resolved = dataDir({ profile: _profileHint });
-    const src = _profileHint ? 'config.profile'
-      : (process.env.DSH_PROFILE_DIR ? 'env.DSH_PROFILE_DIR'
-        : (process.env.DSH_PROFILE ? 'env.DSH_PROFILE' : 'fallback(default)'));
-    log(`台账目录：${resolved}（来源：${src}）`);
+  ACTIVE_PROFILE_HINT = PLUGIN_CFG; // 0.2.4：让 dataDir()/db() 优先读 config.profile / config.profileName
+  const dirInfo = resolveDataDir(PLUGIN_CFG);
+  const nextDbPath = path.join(dirInfo.dir, 'tasks.db');
+  if (_sqlite && _sqlite.path !== nextDbPath) {
+    try { _sqlite.close(); } catch { /* 切换 profile 时先关旧库句柄 */ }
+    _sqlite = null;
   }
+  ACTIVE_DB_PATH = nextDbPath;
+  log(`台账目录：${dirInfo.dir}（来源：${dirInfo.source}）`);
 
   // -------------------------------------------------------------------------
   // 统一配置读取（0.2.1）：task_create 的限额、维护循环、保留天数都走这一份。
@@ -1120,10 +1109,15 @@ export function apply(ctx, config) {
               return { ok: false, text: `建任务失败：拿不到本会话的沙箱策略（${why}），拒绝无沙箱执行。（taskId=${id}）` };
             }
             if (policy.mode === 'danger-full-access') {
-              // 显式放行：直接用原始 argv，这是宿主明确允许的
-              argv = wrapped;
-              // 只有这条分支才需要 verbatim（见 spawn 处的解释）：
-              // 这是我们自己拼的 `cmd.exe /d /s /c <原文>`，后面那一段必须原样交过去。
+              // 显式放行：直接用原始命令，这是宿主明确允许的。
+              // 0.2.4 跨平台修：Windows `cmd.exe /d /s /c` 在首字符为 `"` 时（例如 `"C:\Program Files\...\node.exe" ...`）
+              // 会被 `/s` 无条件剥掉首尾引号，导致带空格的可执行文件路径断词报错（`'C:\Program' 不是内部或外部命令`）。
+              // 与 Node.js 官方 `spawn({ shell: true })` 做法一致：外层统一多包一对 `"` 给 `/s` 剥离，
+              // 内部整条命令（含首尾引号与带空格路径）得以原样保留。
+              argv = process.platform === 'win32'
+                ? ['cmd.exe', '/d', '/s', '/c', `"${firstLine}"`]
+                : wrapped;
+              // 只有这条分支才需要 verbatim：我们自己拼的 `cmd.exe /d /s /c "<原文>"` 必须原样交过去。
               verbatim = true;
             } else {
               if (typeof sb?.confine !== 'function') {
@@ -2345,7 +2339,7 @@ export function apply(ctx, config) {
     }),
   ];
 
-  log(`已注册 8 个工具（7 任务 + task_probe 诊断）；数据目录 ${dataDir({ profile: _profileHint })}`);
+  log(`已注册 8 个工具（7 任务 + task_probe 诊断）；数据目录 ${dataDir()}`);
 
   // -------------------------------------------------------------------------
   // 启动自检：能力三态报告（对照《DSH 插件跨版本兼容层开发任务书》§5.2 / §9）。
@@ -2787,8 +2781,10 @@ export function apply(ctx, config) {
     // 0.2.0：卸载时把库关掉（审计 P2-7）。
     // 以前 dispose() 只摘订阅和定时器，_sqlite 一直攥着句柄：
     // 插件重载会累积连接、-wal 永不 checkpoint、Windows 上库文件还被锁住。
-    // 0.2.4：卸载时兑现模块顶部注释，清掉 ACTIVE_CTX 与内存态缓存，不留悬挂引用。
+    // 0.2.4：卸载时兑现模块顶部注释，清掉 ACTIVE_CTX / ACTIVE_PROFILE_HINT / ACTIVE_DB_PATH 与内存态缓存，不留悬挂引用。
     if (ACTIVE_CTX === ctx) ACTIVE_CTX = null;
+    if (ACTIVE_PROFILE_HINT === PLUGIN_CFG) ACTIVE_PROFILE_HINT = null;
+    if (ACTIVE_DB_PATH === nextDbPath) ACTIVE_DB_PATH = null;
     missStreak.clear();
     earlyEnds.clear();
     try {

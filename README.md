@@ -146,7 +146,7 @@ background jobs unavailable: no job controller serves this agent
 3. **Windows 主要路径实测过。** GBK 解码、`taskkill /T` 这些都有平台分支，Linux / macOS 没测。
 4. **数据是一个 SQLite 库**：`~/.dsh/background-task-coordinator/<profile>/tasks.db`（WAL 模式）。可以直接看（`node:sqlite` 或任意 sqlite3 客户端）、直接删——删了下次启动重建空账，不影响 DSH。
 
-   **0.2.0 起按 profile 隔离，0.2.4 防同名 profile 串库。** 位于默认 `~/.dsh/profiles/<name>` 下的 profile 沿用 `~/.dsh/background-task-coordinator/<name>/tasks.db`；若来自不同根目录、自定义 `DSH_HOME` 或清洗截断后的名字，自动附带完整路径 8 位 SHA-256 指纹（`<name>-<hash>`），避免不同目录下的同名 profile（如两个 `default`）共用同一份库。POSIX 下目录自动收紧为 `0700`、库文件为 `0600`。
+   **0.2.0 起按 profile 隔离，0.2.4 合入 `config.profile` 支持并防同名 profile 串库。** 优先级：① `cordis.patch.yml` 中的 `config.profile` / `config.profileName`（解决部分机器 host 子进程读不到 `DSH_PROFILE*` 环境变量的问题）→ ② `DSH_PROFILE_DIR`（位于默认 `~/.dsh/profiles/<name>` 下沿用 `<name>`；来自不同根目录、自定义 `DSH_HOME` 或清洗截断后的名字自动附带 8 位 SHA-256 路径指纹 `<name>-<hash>`）→ ③ `DSH_PROFILE` / `DSH_PROFILE_NAME` → ④ `default`。启动时会打印 `台账目录：...（来源：...）`，POSIX 下目录自动收紧为 `0700`、库文件为 `0600`。
 
    **落盘脱敏与旧 JSON 清理（0.2.4）**：写进 SQLite 的命令目标、已落盘追加指令、上下文与事件流水会自动对常见内联凭据（`KEY=`/`TOKEN=`/`PASSWORD=`、`Bearer`、`sk-`/`ghp_`/`AKIA`、`--token`、URL 密码）脱敏（不影响实际运行参数）；旧版 `tasks.json` 迁入并 checkpoint 落盘后直接删除源文件，并清理历史遗留的 `tasks.json.migrated` 明文副本。
 
@@ -241,12 +241,12 @@ background jobs unavailable: no job controller serves this agent
 | `stopReason` 空串落 `failed` | 假失败（和以前假成功一样糟） | 按宿主真实枚举映射，空串落 `succeeded` 但注明「未给出原因」 |
 | **`cmd /s /c` 把引号拼成字面量**（新发现） | 任何带引号/带空格的命令都报 `Cannot find module '..."..."'` | `spawn` 加 `windowsVerbatimArguments`（仅 danger-full-access 分支） |
 
-测试三套，**146 项全绿**（0.2.4 起）：
+测试三套，**150 项全绿**（0.2.4 起）：
 
 ```
 主回归      16/16
 下游补丁     9/9
-专项      121/121
+专项      125/125
 ```
 
 其中几条是专门设计成「能反驳自己」的——比如断言旧 `listTasks({limit:500})` 写法在 601 条台账下**确实漏掉活动任务**，用来证明修的是真 bug。迁移那条用本机真实旧库（含 2.1 MB WAL）跑过：29 任务 / 53 事件 / 5 消息全保留。
@@ -345,12 +345,12 @@ background jobs unavailable: no job controller serves this agent
 | 超时清账漏掉无 `sessionId` 的 `subagent` | `task_cancel` 把绑定但无 `nativeSessionId` 的任务留在 `cancel_requested` 等超时收尾，但 `sweepTimer` 没处理这类任务 | `sweepTimer` 对超时的未绑定或 `cancel_requested` 无会话 id 子代理落 `lost` 并通知 |
 | `dispose()` 遗留悬挂引用 | 顶部注释写明卸载清 `ACTIVE_CTX`，但 `dispose()` 漏清 `ACTIVE_CTX` / `_log` / 内存缓存 | 卸载时按实例比对清理 `ACTIVE_CTX`、`_log`、`missStreak`、`earlyEnds` |
 | `tests/v020.mjs:173` 硬编码本机路径 | 写死 `C:/Users/stop/...`，换机跑 `npm test` 直接 `ENOENT` | 改为相对模块路径 `new URL('../index.js', import.meta.url)` |
-| 后台命令继承宿主凭据 | `spawn` 透传 `sandboxed.env` 仍铺在完整 `process.env` 上，无 `sandboxed.env` 时更是直接继承全量 `process.env` | 对齐 DSH `scrubbedParentEnv()`，过滤 `KEY/PASSWORD/PASSWD/SECRET/TOKEN/CREDENTIAL` 与 `DSH_*` 后再叠加 `sandboxed.env` |
-| 首次绑定未验证子代理父子归属 | 共享 profile 下会话 B 可给自己的任务首次传入 A 的子代理 `sessionId`，继而跨会话发指令或取消 | 新增 `resolveSubagentBinding()`，结合 `subagents`（`listDescendants`/`listChildren`/`resolveName`）、`agents`/`sessions` 父会话字段与 SQLite 跨会话唯一校验拒绝越权首次绑定 |
+| 后台命令继承宿主凭据 + Windows 首尾引号断词 | `spawn` 透传 `sandboxed.env` 仍铺在完整 `process.env` 上；Windows `cmd.exe /d /s /c` 遇到首字符为 `"` 的命令（如 `"C:\Program Files\...\node.exe" ...`）会被 `/s` 剥掉首尾引号 | 对齐 DSH `scrubbedParentEnv()` 过滤凭据与 `DSH_*` 后再叠加 `sandboxed.env`；`win32` `danger-full-access` 分支外层统一多包一对 `"` 让 `/s` 剥离 |
+| 首次绑定未验证子代理父子归属 | 共享 profile 下会话 B 可首次将别人的子代理 `sessionId` 绑到自己任务上，继而跨会话发指令或取消 | 新增 `resolveSubagentBinding()`（无 `subagents` 服务时不误拒；有服务时结合子树 / `resolveName` / 正向确权父会话元数据核验），并辅以 SQLite 跨会话唯一校验 |
 | `jobs.kill` 忽略回执过早报「已取消」 | DSH 的 `jobs.kill()` 可仅返回 `'requested'`（进程仍在 `stopping`），插件直接写 `cancelled` 并告知用户「已取消」 | 消费 `jobs.kill` 回执并复核 `jobs.get` / 同步 settled：`'requested'` 或原生仍运行/停止中时落 `cancel_requested`，等原生终态确认 |
-| 同名 profile 串库 + 明文留存 + `.migrated` 副本 | `dataDir()` 仅取 basename；命令/追加指令明文入库；旧 `tasks.json` 迁移后留 `.migrated` 副本 | 非默认根目录/自定义 `DSH_HOME` 加 8 位路径指纹隔离；SQLite 落盘脱敏且 POSIX 目录 `0700`/库 `0600`；迁移 checkpoint 后删源并清遗留 `.migrated` |
+| `config.profile` 支持 + 同名 profile 串库 + 明文留存 + `.migrated` 副本 | host 子进程拿不到 env 时退回 `default/`；`dataDir()` 仅取 basename；命令/追加指令明文入库；旧 `tasks.json` 迁移后留 `.migrated` 副本 | 优先级 `config.profile` → `DSH_PROFILE_DIR`（非默认根目录加 8 位路径指纹）→ `DSH_PROFILE` → `default` 并打来源日志；SQLite 落盘脱敏且 POSIX `0700`/`0600`；迁移 checkpoint 后删源并清遗留 `.migrated` |
 
-顺带收尾三处细节：`task_create` 识别仅有 `exec.agent.session.id` 的宿主、`task_describe`/`task_append_message` 在 `nativeSessionId` 为空时不再拿 agent 名字碰按 session id 索引的注册表、`task_context` 拒绝浮点 `expectedVersion`（如 `1.5`）。
+顺带收尾：`toTaskHandle()` 补齐 `ownerSessionId`、`task_create` 识别仅有 `exec.agent.session.id` 的宿主、`task_describe`/`task_append_message` 在 `nativeSessionId` 为空时不再拿 agent 名字碰按 session id 索引的注册表、`task_context` 拒绝浮点 `expectedVersion`（如 `1.5`）。
 
 ## 十、许可
 

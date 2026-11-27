@@ -38,6 +38,14 @@ export function getSubagentsService(ctx) {
  *     调用方必须拒绝首次绑定，防止共享 profile 下借别人的子代理 sessionId 跨会话发指令或取消；
  *   - `sid` 为已校验/解析出的子代理会话 id，解析不到为 null。
  *
+ * 降级边界（明确约定，避免在精简/旧版宿主上误伤正常绑定）：
+ *   1. 若 `agents.get(sid)` 或 `sessions.get(sid)` 暴露了父会话字段且与当前父会话不一致 → 一律拒绝；
+ *   2. 若宿主**完全不提供** `subagents` 的 `listDescendants` / `listChildren` / `resolveName`
+ *      （`!canList && !canResolve`）→ **不误拒**，放行并交由元数据父会话核验 + SQLite 跨会话唯一校验兜底；
+ *   3. 若宿主提供了 `subagents` 枚举/解析服务，则要求目标在子树或 `resolveName` 中命中，
+ *      或已由 `agents`/`sessions` 元数据正向确权（`metadataConfirmed === true`，兼容已结束子代理被移出 listChildren 的早到竞态），
+ *      否则 fail-closed 拒绝。
+ *
  * @param {object} ctx              Cordis 上下文
  * @param {string} agentName        原生 subagent 工具给的 agent 名
  * @param {object|undefined} caller 发起方 agent（需要 .session.id 作父会话）
@@ -118,26 +126,29 @@ export async function resolveSubagentBinding(ctx, agentName, caller, given) {
           return { ok: true, verified: true };
         }
       } catch {
-        // list 查询失败时如果还能通过 caller-scoped resolveName 确认则放行，否则 fail-closed
+        // list 查询失败时：若 resolveName 或已正向确权的父会话元数据可证实归属则放行，否则 fail-closed
         if (canResolve && caller) {
           try {
             const r = await sub.resolveName(caller, name);
             if (r && String(r) !== name && String(r) === String(candidateSid)) {
               return { ok: true, verified: true };
             }
-          } catch { /* 落到拒绝 */ }
+          } catch { /* 落到下一步 */ }
         }
+        if (metadataConfirmed) return { ok: true, verified: true };
         return { ok: false, verified: false, reason: '核验子代理归属失败（subagents 服务异常），拒绝盲绑' };
       }
-      // 不在子列表中：再给 resolveName 一次机会（兼容 listChildren 只列直接子级而目标由 resolveName 确认的情况）
+      // 不在子列表中：再给 resolveName 一次机会（兼容 listChildren 只列直接子级或已裁剪结束项）
       if (canResolve && caller) {
         try {
           const r = await sub.resolveName(caller, name);
           if (r && String(r) !== name && String(r) === String(candidateSid)) {
             return { ok: true, verified: true };
           }
-        } catch { /* 落到拒绝 */ }
+        } catch { /* 落到下一步 */ }
       }
+      // 若 agents/sessions 元数据已正向证明 parentSessionId === 当前父会话（如早到结束的子代理已从 listChildren 移出），允许绑定
+      if (metadataConfirmed) return { ok: true, verified: true };
       return { ok: false, verified: false, reason: `子代理会话 ${candidateSid} 不属于当前父会话的子代理列表` };
     }
     // 只有 resolveName（无 listChildren/listDescendants）
