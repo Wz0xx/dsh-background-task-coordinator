@@ -1,0 +1,23 @@
+# 统一换行符为 LF —— 0.2.9
+#
+# 为什么需要：本机 core.autocrlf=true，没有这个文件时 git 检出会把 .js 转成 CRLF，
+# 而测试里有几处用字符串锚点切源码（`src.indexOf('// 台账存储')`），
+# 写死 '\n' 的锚点在 CRLF 环境下匹配失败 → indexOf 返回 -1 →
+# slice(s0, -1) 取到文件末尾 → 把 import 包进 new Function → 测试直接崩。
+#
+# 这种 bug 在本机永远是绿的（工作区恰好 LF），只有别人 clone 下来才炸。
+# 与其到处防 CRLF，不如让仓库里的文本文件统一 LF。
+#
+# 注意：*.bat / *.cmd 必须是 CRLF，Windows 批处理对 LF 不友好。
+* text=auto eol=lf
+
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# 二进制，别碰
+*.png binary
+*.jpg binary
+*.zip binary
+*.tgz binary
+*.db binary
+*.asar binary

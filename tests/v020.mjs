@@ -1181,7 +1181,13 @@ const rm = (p) => { try { fs.rmSync(p, { recursive: true, force: true, maxRetrie
   // 19.1–19.2 解码器边界：直接拿 index.js 里的 makeChunkDecoder 做单元测试
   const src = fs.readFileSync(new URL('../index.js', import.meta.url), 'utf8');
   const s0 = src.indexOf('function makeChunkDecoder()');
-  const s1 = src.indexOf('// ---------------------------------------------------------------------------\n// 台账存储');
+  // 0.2.8 修：锚点不能写死 '\n'。
+  // git 检出时会按 core.autocrlf 把 LF 转成 CRLF，clone 出来的 index.js 是 CRLF，
+  // 而测试里写死 '\n// 台账存储' 匹配不上 → indexOf 返回 -1 → slice(s0, -1) 取到文件末尾
+  // → 把后面的 import 语句也包进 new Function → "Cannot use import statement outside a module"。
+  // 本机测试一直绿，是因为工作区恰好是 LF；别人 clone 下来跑就直接崩。
+  const s1 = src.search(/\r?\n\/\/ -+\r?\n\/\/ 台账存储/);
+  if (s0 < 0 || s1 < 0) throw new Error('无法定位 makeChunkDecoder 边界（锚点没匹配上）');
   const mk = new Function(src.slice(s0, s1) + '; return makeChunkDecoder;')();
 
   // 「A中」= 41 D6 D0 一次给完：旧实现 end() 直接 toString('utf8') 会出 "A��"
@@ -2370,7 +2376,11 @@ const rm = (p) => { try { fs.rmSync(p, { recursive: true, force: true, maxRetrie
 {
   const srcR = fs.readFileSync(new URL('../index.js', import.meta.url), 'utf8');
   const r0 = srcR.indexOf('function redactSecrets(input) {');
-  const r1 = srcR.indexOf('\n}', r0) + 2;
+  // 同样不能写死 '\n}'：CRLF 检出时匹配不上，indexOf 返回 -1，
+  // 后面的 slice(r0, -1) 会取到文件末尾，把 import 包进来就炸。
+  const r1rel = srcR.slice(r0).search(/\r?\n\}/);
+  if (r0 < 0 || r1rel < 0) throw new Error('无法定位 redactSecrets 边界');
+  const r1 = r0 + r1rel + (srcR.slice(r0 + r1rel).startsWith('\r\n') ? 3 : 2);
   const redact = new Function(srcR.slice(r0, r1) + '; return redactSecrets;')();
 
   // 28.1 常见凭据格式必须抓住
