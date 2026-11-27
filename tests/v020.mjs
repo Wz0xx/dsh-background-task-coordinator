@@ -810,6 +810,368 @@ const rm = (p) => { try { fs.rmSync(p, { recursive: true, force: true, maxRetrie
   rm(home);
 }
 
+// ---------------------------------------------------------------------------
+// 13. P2-1 探活二次确认：单次 miss 不许杀活任务
+// ---------------------------------------------------------------------------
+{
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'v022-miss-'));
+  const saved = { U: process.env.USERPROFILE, H: process.env.HOME, P: process.env.DSH_PROFILE_DIR, L: process.env.DSH_COORD_LIMITS };
+  process.env.USERPROFILE = home; process.env.HOME = home;
+  process.env.DSH_PROFILE_DIR = path.join(home, '.dsh', 'profiles', 'miss');
+  delete process.env.DSH_PROFILE;
+  delete process.env.DSH_COORD_LIMITS;
+
+  const mod = await import(`${ROOT}/index.js?sec=miss`);
+  const R = {};
+  // flaky：第一次查不到、第二次查得到 —— 模拟注册表瞬时抖动
+  let calls = 0;
+  const ctx = mkCtx({
+    logger: { info: () => {} },
+    jobs: { start() { return 'nj'; }, get() { return { status: 'running' }; }, readAt() { return { chunks: [] }; }, kill() {}, events: { subscribe() { return () => {}; } } },
+    agents: {
+      get(id) {
+        if (id === 'sess-FLAKY') {
+          calls += 1;
+          return calls === 1 ? undefined : { status: {}, followup() {}, steer() {}, cancel() {} };
+        }
+        return undefined;
+      },
+    },
+    workingDirectory: { ensure: async () => process.cwd() },
+    sandboxPolicy: { resolve: async () => ({ mode: 'danger-full-access' }) },
+    sandbox: { confine: async (a) => ({ argv: a }) },
+    tools: { register(t) { R[t.name] = t; } }, on() { return () => {}; },
+  });
+  mod.default.apply(ctx, { global: 20, perOwner: 20, timeoutMinutes: 120, sweepSeconds: 600, retentionDays: 30 });
+  const ex = { agent: { id: 's-miss', session: { id: 's-miss' } } };
+  const dbp = path.join(home, '.dsh', 'background-task-coordinator', 'miss', 'tasks.db');
+  const { DatabaseSync } = await import('node:sqlite');
+  const get1 = (sql, ...a) => { const ro = new DatabaseSync(dbp, { readOnly: true }); const v = ro.prepare(sql).get(...a); ro.close(); return v; };
+  const set = (sql, ...a) => { const w = new DatabaseSync(dbp); w.prepare(sql).run(...a); w.close(); };
+
+  const r = await R.task_create.execute({ type: 'subagent', title: 'flaky', objective: 'x' }, ex);
+  const tid = r.text.match(/taskId=([\w-]+)/)?.[1];
+  await R.task_register_delegation.execute({ taskId: tid, agentId: 'agF', sessionId: 'sess-FLAKY' }, ex);
+  set("UPDATE tasks SET native_session_id='sess-FLAKY', status='running' WHERE id=?", tid);
+
+  // 第一轮 task_list：探活 miss 1 次 → 不许判死
+  await R.task_list.execute({ all: true }, ex);
+  ok('13.1 单次探活 miss 不判死', get1("SELECT status FROM tasks WHERE id=?", tid).status === 'running',
+    get1("SELECT status FROM tasks WHERE id=?", tid).status);
+
+  // 第二轮：这次查到了 → 清计数，仍活着
+  await R.task_list.execute({ all: true }, ex);
+  ok('13.2 查到一次就清掉怀疑', get1("SELECT status FROM tasks WHERE id=?", tid).status === 'running');
+
+  // 另建一个持续查不到的：连续两轮才落 lost
+  const r2 = await R.task_create.execute({ type: 'subagent', title: 'gone', objective: 'x' }, ex);
+  const tid2 = r2.text.match(/taskId=([\w-]+)/)?.[1];
+  await R.task_register_delegation.execute({ taskId: tid2, agentId: 'agG', sessionId: 'sess-GONE' }, ex);
+  set("UPDATE tasks SET native_session_id='sess-GONE', status='running' WHERE id=?", tid2);
+  await R.task_list.execute({ all: true }, ex);
+  const afterOne = get1("SELECT status FROM tasks WHERE id=?", tid2).status;
+  await R.task_list.execute({ all: true }, ex);
+  const afterTwo = get1("SELECT status FROM tasks WHERE id=?", tid2).status;
+  ok('13.3 持续查不到：第一轮不动', afterOne === 'running', afterOne);
+  ok('13.4 持续查不到：第二轮落 lost', afterTwo === 'lost', afterTwo);
+
+  if (saved.U !== undefined) process.env.USERPROFILE = saved.U;
+  if (saved.H !== undefined) process.env.HOME = saved.H;
+  if (saved.P !== undefined) process.env.DSH_PROFILE_DIR = saved.P;
+  if (saved.L !== undefined) process.env.DSH_COORD_LIMITS = saved.L;
+  rm(home);
+}
+
+// ---------------------------------------------------------------------------
+// 14. P2-3 秒结竞态：绑定前到达的 subagent/end 必须回放
+// ---------------------------------------------------------------------------
+{
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'v022-early-'));
+  const saved = { U: process.env.USERPROFILE, H: process.env.HOME, P: process.env.DSH_PROFILE_DIR, L: process.env.DSH_COORD_LIMITS };
+  process.env.USERPROFILE = home; process.env.HOME = home;
+  process.env.DSH_PROFILE_DIR = path.join(home, '.dsh', 'profiles', 'early');
+  delete process.env.DSH_PROFILE;
+  delete process.env.DSH_COORD_LIMITS;
+
+  const mod = await import(`${ROOT}/index.js?sec=early`);
+  const R = {}, listeners = {};
+  const ctx = mkCtx({
+    logger: { info: () => {} },
+    jobs: { start() { return 'nj'; }, get() { return { status: 'running' }; }, readAt() { return { chunks: [] }; }, kill() {}, events: { subscribe() { return () => {}; } } },
+    agents: { get() { return undefined; } },
+    workingDirectory: { ensure: async () => process.cwd() },
+    sandboxPolicy: { resolve: async () => ({ mode: 'danger-full-access' }) },
+    sandbox: { confine: async (a) => ({ argv: a }) },
+    tools: { register(t) { R[t.name] = t; } },
+    on(ev, fn) { listeners[ev] = fn; return () => {}; },
+  });
+  mod.default.apply(ctx, { global: 20, perOwner: 20, timeoutMinutes: 120, sweepSeconds: 600, retentionDays: 30 });
+  const ex = { agent: { id: 's-early', session: { id: 's-early' } } };
+  const dbp = path.join(home, '.dsh', 'background-task-coordinator', 'early', 'tasks.db');
+  const { DatabaseSync } = await import('node:sqlite');
+  const get1 = (sql, ...a) => { const ro = new DatabaseSync(dbp, { readOnly: true }); const v = ro.prepare(sql).get(...a); ro.close(); return v; };
+
+  const r = await R.task_create.execute({ type: 'subagent', title: 'fast', objective: 'x' }, ex);
+  const tid = r.text.match(/taskId=([\w-]+)/)?.[1];
+
+  // 关键时序：事件先到（此时还没绑定，nativeSessionId 为空，匹配不上）
+  listeners['subagent/end']({ id: 'sess-FAST', stopReason: 'completed' });
+  ok('14.1 事件早到时任务还是 queued', get1("SELECT status FROM tasks WHERE id=?", tid).status === 'queued',
+    get1("SELECT status FROM tasks WHERE id=?", tid).status);
+
+  // 然后才绑定 —— 应该回放那条结算
+  const rb = await R.task_register_delegation.execute(
+    { taskId: tid, agentId: 'agFast', sessionId: 'sess-FAST' }, ex);
+  const st = get1("SELECT status FROM tasks WHERE id=?", tid).status;
+  ok('14.2 绑定后回放早到结算 → succeeded', st === 'succeeded', st);
+  ok('14.3 返回文案如实说明（不再说「进入 running」）',
+    rb.text.includes('已经结束') && !rb.text.includes('任务进入 running'), rb.text.split('\n')[0].slice(0, 50));
+
+  // 14.4 早到的 aborted 也应该按取消落账
+  const r2 = await R.task_create.execute({ type: 'subagent', title: 'fast2', objective: 'x' }, ex);
+  const tid2 = r2.text.match(/taskId=([\w-]+)/)?.[1];
+  listeners['subagent/end']({ id: 'sess-FAST2', stopReason: 'aborted' });
+  await R.task_register_delegation.execute({ taskId: tid2, agentId: 'agFast2', sessionId: 'sess-FAST2' }, ex);
+  ok('14.4 早到的 aborted 回放成 cancelled',
+    get1("SELECT status FROM tasks WHERE id=?", tid2).status === 'cancelled',
+    get1("SELECT status FROM tasks WHERE id=?", tid2).status);
+
+  if (saved.U !== undefined) process.env.USERPROFILE = saved.U;
+  if (saved.H !== undefined) process.env.HOME = saved.H;
+  if (saved.P !== undefined) process.env.DSH_PROFILE_DIR = saved.P;
+  if (saved.L !== undefined) process.env.DSH_COORD_LIMITS = saved.L;
+  rm(home);
+}
+
+// ---------------------------------------------------------------------------
+// 15. P1-2 残留：首行空行必须拦、taskkill 不许同步阻塞
+// ---------------------------------------------------------------------------
+{
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'v022-misc-'));
+  const saved = { U: process.env.USERPROFILE, H: process.env.HOME, P: process.env.DSH_PROFILE_DIR, L: process.env.DSH_COORD_LIMITS };
+  process.env.USERPROFILE = home; process.env.HOME = home;
+  process.env.DSH_PROFILE_DIR = path.join(home, '.dsh', 'profiles', 'm2');
+  delete process.env.DSH_PROFILE;
+  delete process.env.DSH_COORD_LIMITS;
+
+  const mod = await import(`${ROOT}/index.js?sec=m2`);
+  const R = {};
+  const ctx = mkCtx({
+    logger: { info: () => {} },
+    jobs: { start() { return 'nj'; }, get() { return { status: 'running' }; }, readAt() { return { chunks: [] }; }, kill() {}, events: { subscribe() { return () => {}; } } },
+    agents: { get() { return undefined; } },
+    workingDirectory: { ensure: async () => process.cwd() },
+    sandboxPolicy: { resolve: async () => ({ mode: 'danger-full-access' }) },
+    sandbox: { confine: async (a) => ({ argv: a }) },
+    tools: { register(t) { R[t.name] = t; } }, on() { return () => {}; },
+  });
+  mod.default.apply(ctx, { global: 20, perOwner: 20, timeoutMinutes: 120, sweepSeconds: 600, retentionDays: 30 });
+  const ex = { agent: { id: 's-m2', session: { id: 's-m2' } } };
+
+  const r = await R.task_create.execute({ type: 'job', title: 'empty', objective: '\nnpm test\n说明' }, ex);
+  ok('15.1 首行为空被拦下（不再 spawn 空命令）', !r.ok && r.text.includes('第一行'), r.text.slice(0, 50));
+
+  const r2 = await R.task_create.execute({ type: 'job', title: 'spaces', objective: '   \n echo hi' }, ex);
+  ok('15.2 首行全是空白也拦', !r2.ok, r2.text.slice(0, 40));
+
+  const src = fs.readFileSync(new URL('../index.js', import.meta.url), 'utf8');
+  ok('15.3 已无 execSync（不再同步阻塞事件循环）', !/import\s*\{[^}]*execSync/.test(src) && !/execSync\(/.test(src),
+    /execSync\(/.test(src) ? '仍有调用' : '已清除');
+
+  if (saved.U !== undefined) process.env.USERPROFILE = saved.U;
+  if (saved.H !== undefined) process.env.HOME = saved.H;
+  if (saved.P !== undefined) process.env.DSH_PROFILE_DIR = saved.P;
+  if (saved.L !== undefined) process.env.DSH_COORD_LIMITS = saved.L;
+  rm(home);
+}
+
+// ---------------------------------------------------------------------------
+// 16. P2-8 job 探活补账：结算事件缺失时不再永远 running
+// ---------------------------------------------------------------------------
+{
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'v022-jobscan-'));
+  const saved = { U: process.env.USERPROFILE, H: process.env.HOME, P: process.env.DSH_PROFILE_DIR, L: process.env.DSH_COORD_LIMITS };
+  process.env.USERPROFILE = home; process.env.HOME = home;
+  process.env.DSH_PROFILE_DIR = path.join(home, '.dsh', 'profiles', 'js');
+  delete process.env.DSH_PROFILE;
+  delete process.env.DSH_COORD_LIMITS;
+
+  const mod = await import(`${ROOT}/index.js?sec=jobscan`);
+  const R = {};
+  // jobNative 控制 ctx.jobs.get 的返回：模拟「结算事件没送来，但原生其实已结束」
+  const jobNative = { 'nj-done': { status: 'completed', detail: 'exit 0' }, 'nj-run': { status: 'running' } };
+  const ctx = mkCtx({
+    logger: { info: () => {} },
+    jobs: {
+      start() { return 'nj-run'; },
+      get(id) { return jobNative[id]; },
+      readAt() { return { chunks: [] }; }, kill() {},
+      // 故意不提供 events.subscribe —— 模拟结算事件通路不存在
+    },
+    agents: { get() { return undefined; } },
+    workingDirectory: { ensure: async () => process.cwd() },
+    sandboxPolicy: { resolve: async () => ({ mode: 'danger-full-access' }) },
+    sandbox: { confine: async (a) => ({ argv: a }) },
+    tools: { register(t) { R[t.name] = t; } }, on() { return () => {}; },
+  });
+  mod.default.apply(ctx, { global: 20, perOwner: 20, timeoutMinutes: 120, sweepSeconds: 600, retentionDays: 30 });
+  const ex = { agent: { id: 's-js', session: { id: 's-js' } } };
+  const dbp = path.join(home, '.dsh', 'background-task-coordinator', 'js', 'tasks.db');
+  const { DatabaseSync } = await import('node:sqlite');
+  const get1 = (sql, ...a) => { const ro = new DatabaseSync(dbp, { readOnly: true }); const v = ro.prepare(sql).get(...a); ro.close(); return v; };
+  const set = (sql, ...a) => { const w = new DatabaseSync(dbp); w.prepare(sql).run(...a); w.close(); };
+
+  const r = await R.task_create.execute({ type: 'job', title: 'lostsettle', objective: 'echo hi' }, ex);
+  const tid = r.text.match(/taskId=([\w-]+)/)?.[1];
+  // 台账记的 nativeId='nj-run'；把原生改成已完成，模拟「事件丢了但 job 早结束」
+  set("UPDATE tasks SET native_id='nj-done' WHERE id=?", tid);
+  await R.task_list.execute({ all: true }, ex);
+  const st = get1("SELECT status,result_summary FROM tasks WHERE id=?", tid);
+  ok('16.1 结算事件缺失时，job 探活补账为 succeeded', st.status === 'succeeded', `${st.status} / ${st.result_summary}`);
+
+  // 还在跑的 job 不许被碰
+  const r2 = await R.task_create.execute({ type: 'job', title: 'stillrun', objective: 'echo hi' }, ex);
+  const tid2 = r2.text.match(/taskId=([\w-]+)/)?.[1];
+  await R.task_list.execute({ all: true }, ex);
+  ok('16.2 还在跑的 job 不动', get1("SELECT status FROM tasks WHERE id=?", tid2).status === 'running',
+    get1("SELECT status FROM tasks WHERE id=?", tid2).status);
+
+  if (saved.U !== undefined) process.env.USERPROFILE = saved.U;
+  if (saved.H !== undefined) process.env.HOME = saved.H;
+  if (saved.P !== undefined) process.env.DSH_PROFILE_DIR = saved.P;
+  if (saved.L !== undefined) process.env.DSH_COORD_LIMITS = saved.L;
+  rm(home);
+}
+
+// ---------------------------------------------------------------------------
+// 17. P2-5 task_context 暴露 expectedVersion：并发覆盖能被检测
+// ---------------------------------------------------------------------------
+{
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'v022-ctx-'));
+  const saved = { U: process.env.USERPROFILE, H: process.env.HOME, P: process.env.DSH_PROFILE_DIR, L: process.env.DSH_COORD_LIMITS };
+  process.env.USERPROFILE = home; process.env.HOME = home;
+  process.env.DSH_PROFILE_DIR = path.join(home, '.dsh', 'profiles', 'cx');
+  delete process.env.DSH_PROFILE;
+  delete process.env.DSH_COORD_LIMITS;
+
+  const mod = await import(`${ROOT}/index.js?sec=ctxver`);
+  const R = {};
+  const ctx = mkCtx({
+    logger: { info: () => {} },
+    jobs: { start() { return 'nj'; }, get() { return { status: 'running' }; }, readAt() { return { chunks: [] }; }, kill() {}, events: { subscribe() { return () => {}; } } },
+    agents: { get() { return undefined; } },
+    workingDirectory: { ensure: async () => process.cwd() },
+    sandboxPolicy: { resolve: async () => ({ mode: 'danger-full-access' }) },
+    sandbox: { confine: async (a) => ({ argv: a }) },
+    tools: { register(t) { R[t.name] = t; } }, on() { return () => {}; },
+  });
+  mod.default.apply(ctx, { global: 20, perOwner: 20, timeoutMinutes: 120, sweepSeconds: 600, retentionDays: 30 });
+  const ex = { agent: { id: 's-cx', session: { id: 's-cx' } } };
+  const r = await R.task_create.execute({ type: 'subagent', title: 'ctxrace', objective: 'x' }, ex);
+  const tid = r.text.match(/taskId=([\w-]+)/)?.[1];
+
+  // 代理 A 写第一版
+  let w = await R.task_context.execute({ taskId: tid, stage: 'A写的' }, ex);
+  ok('17.1 首写成功（v1）', w.ok && /v1/.test(w.text), w.text.slice(0, 30));
+
+  // 代理 B 基于 v1 写 —— 应该成功，变成 v2
+  w = await R.task_context.execute({ taskId: tid, stage: 'B写的', expectedVersion: 1 }, ex);
+  ok('17.2 基于正确版本写成功（v2）', w.ok && /v2/.test(w.text), w.text.slice(0, 40));
+
+  // 代理 A 还拿旧的 v1 写 —— 必须被拒，不能覆盖 B
+  w = await R.task_context.execute({ taskId: tid, stage: 'A又写的', expectedVersion: 1 }, ex);
+  ok('17.3 基于过期版本被拒（不覆盖别人）', !w.ok && w.text.includes('版本冲突'), w.text.slice(0, 50));
+
+  // 读回来确认是 B 的内容，没被 A 覆盖
+  const c = await R.task_context.execute({ taskId: tid }, ex);
+  ok('17.4 内容仍是 B 写的', c.text.includes('B写的') && !c.text.includes('A又写的'), c.text.split('\n')[1]);
+
+  // 不传 expectedVersion 时仍是旧行为（能写，但不保证并发安全）
+  w = await R.task_context.execute({ taskId: tid, stage: 'C写的' }, ex);
+  ok('17.5 不传 expectedVersion 仍可用（向后兼容）', w.ok, w.text.slice(0, 30));
+
+  if (saved.U !== undefined) process.env.USERPROFILE = saved.U;
+  if (saved.H !== undefined) process.env.HOME = saved.H;
+  if (saved.P !== undefined) process.env.DSH_PROFILE_DIR = saved.P;
+  if (saved.L !== undefined) process.env.DSH_COORD_LIMITS = saved.L;
+  rm(home);
+}
+
+// ---------------------------------------------------------------------------
+// 18. P2-9 终态通知真投递：自产终态要投到发起会话，原生结算不重复投
+// ---------------------------------------------------------------------------
+{
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'v022-notify-'));
+  const saved = { U: process.env.USERPROFILE, H: process.env.HOME, P: process.env.DSH_PROFILE_DIR, L: process.env.DSH_COORD_LIMITS };
+  process.env.USERPROFILE = home; process.env.HOME = home;
+  process.env.DSH_PROFILE_DIR = path.join(home, '.dsh', 'profiles', 'nt');
+  delete process.env.DSH_PROFILE;
+  delete process.env.DSH_COORD_LIMITS;
+
+  const mod = await import(`${ROOT}/index.js?sec=notify`);
+  const R = {}, listeners = {}, inbox = [];
+  const ctx = mkCtx({
+    logger: { info: () => {} },
+    jobs: { start() { return 'nj'; }, get() { return { status: 'running' }; }, readAt() { return { chunks: [] }; }, kill() {}, events: { subscribe() { return () => {}; } } },
+    agents: {
+      get(id) {
+        // 发起会话有活 agent，收通知
+        return id === 'owner-N' ? {
+          status: {},
+          followup(m) { inbox.push({ to: id, text: m.content?.[0]?.text }); },
+          steer() {}, cancel() {},
+        } : undefined;
+      },
+    },
+    workingDirectory: { ensure: async () => process.cwd() },
+    sandboxPolicy: { resolve: async () => ({ mode: 'danger-full-access' }) },
+    sandbox: { confine: async (a) => ({ argv: a }) },
+    tools: { register(t) { R[t.name] = t; } },
+    on(ev, fn) { listeners[ev] = fn; return () => {}; },
+  });
+  mod.default.apply(ctx, { global: 20, perOwner: 20, timeoutMinutes: 120, sweepSeconds: 600, retentionDays: 30 });
+  const ex = { agent: { id: 'owner-N', session: { id: 'owner-N' } } };
+  const dbp = path.join(home, '.dsh', 'background-task-coordinator', 'nt', 'tasks.db');
+  const { DatabaseSync } = await import('node:sqlite');
+  const get1 = (sql, ...a) => { const ro = new DatabaseSync(dbp, { readOnly: true }); const v = ro.prepare(sql).get(...a); ro.close(); return v; };
+  const set = (sql, ...a) => { const w = new DatabaseSync(dbp); w.prepare(sql).run(...a); w.close(); };
+
+  // 18.1 原生结算（subagent/end）不该再投一条 —— 前台本来就会收到
+  let r = await R.task_create.execute({ type: 'subagent', title: 'native-end', objective: 'x' }, ex);
+  const t1 = r.text.match(/taskId=([\w-]+)/)?.[1];
+  await R.task_register_delegation.execute({ taskId: t1, agentId: 'agN', sessionId: 'sess-N1' }, ex);
+  set("UPDATE tasks SET native_session_id='sess-N1', status='running' WHERE id=?", t1);
+  inbox.length = 0;
+  listeners['subagent/end']({ id: 'sess-N1', stopReason: 'completed' });
+  ok('18.1 原生结算不重复投通知（避免噪音）', inbox.length === 0, `${inbox.length} 条`);
+
+  // 18.2 协调器自产的 lost（探活兜底）必须真投
+  const r2 = await R.task_create.execute({ type: 'subagent', title: 'will-lost', objective: 'x' }, ex);
+  const t2 = r2.text.match(/taskId=([\w-]+)/)?.[1];
+  await R.task_register_delegation.execute({ taskId: t2, agentId: 'agL', sessionId: 'sess-GONER' }, ex);
+  set("UPDATE tasks SET native_session_id='sess-GONER', status='running' WHERE id=?", t2);
+  inbox.length = 0;
+  await R.task_list.execute({ all: true }, ex);   // 第 1 轮：miss 1
+  await R.task_list.execute({ all: true }, ex);   // 第 2 轮：落 lost + 投通知
+  ok('18.2 自产 lost 真投到发起会话', inbox.some((m) => String(m.text).includes(t2) && String(m.text).includes('lost')),
+    JSON.stringify(inbox.map((m) => m.text)).slice(0, 120));
+
+  // 18.3 事件流水如实写「已投递」
+  const ev = get1("SELECT payload FROM task_events WHERE task_id=? AND event_type='task.notified'", t2);
+  ok('18.3 事件流水写的是已投递', String(ev?.payload ?? '').includes('已投递'), ev?.payload);
+
+  // 18.4 幂等：同一个终态不会投两遍
+  const n1 = inbox.length;
+  await R.task_list.execute({ all: true }, ex);
+  ok('18.4 同一终态不重复投', inbox.length === n1, `${n1} → ${inbox.length}`);
+
+  if (saved.U !== undefined) process.env.USERPROFILE = saved.U;
+  if (saved.H !== undefined) process.env.HOME = saved.H;
+  if (saved.P !== undefined) process.env.DSH_PROFILE_DIR = saved.P;
+  if (saved.L !== undefined) process.env.DSH_COORD_LIMITS = saved.L;
+  rm(home);
+}
+
 console.log('=== 0.2.0 专项 ===');
 console.log(P.join('\n'));const pass = P.filter((x) => x.startsWith('✅')).length;
 console.log(`\n通过 ${pass}/${P.length}`);

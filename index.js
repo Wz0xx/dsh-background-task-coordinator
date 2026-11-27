@@ -15,7 +15,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
-import { spawn, execSync } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import {
   resolveSubagentSessionId,
@@ -167,10 +167,12 @@ function makeChunkDecoder() {
 // ---------------------------------------------------------------------------
 import { CoordinatorDatabase } from './lib/storage/database.js';
 
-const SCHEMA = 2;
 let _sqlite = null; // CoordinatorDatabase 单例
 // 模块级日志钩子：apply() 时注入，供 migrate 等模块级函数使用
 let _log = () => {};
+// 模块级 ctx 引用：settleNotification 这类模块级函数要给发起会话投消息，
+// 需要 agents 服务。apply() 时注入，dispose 时清掉（不留悬挂引用）。
+let ACTIVE_CTX = null;
 
 function db() {
   if (!_sqlite) {
@@ -275,10 +277,10 @@ function migrateJsonFileIfNeeded() {
   }
 }
 
-// ---- 兼容层：原有工具代码沿用 loadTasks/saveTasks/db.tasks 风格 ----
-// loadTasks 返回 { tasks: {id: 投影}, events: [...] } 的只读快照；
-// saveTasks 变成 no-op（SQLite 同步落库，无需显式保存）。
-// 「读-改-写」的工具路径改用下面的 withTask 原子操作。
+// ---- 台账读取统一走 db() 直查 ----
+// 0.1.x 时代有 loadTasks/saveTasks/withTask 三个入口（内存字典 + 整体落盘）。
+// 转 SQLite 之后它们全成了死代码：工具路径直接 d.getTask / d.listActive / d.updateTaskFields。
+// 0.2.2 删掉 —— 留着会让后来人以为「先 loadTasks 再改再 save」是当前写法。
 
 /**
  * 台账行 → 工具内部用的任务对象（唯一入口）。
@@ -351,36 +353,6 @@ function ownedBy(row, exec) {
   return { ok: false, owner, caller };
 }
 
-function loadTasks() {
-  // 0.2.0：历史遗留的「拉全表投影」入口，已无调用点（工具路径全走 db() 直查）。
-  // 保留函数会误导后来人照抄 `limit: 500`，所以只留一个受限版本：
-  // 活动任务 + 最近 50 条终态，够调试看，不会因为任务累积而截断结算（审计 P1-4）。
-  const d = db();
-  const tasks = {};
-  const rows = [
-    ...d.listActive([...ACTIVE]),
-    ...d.listTasks({ statuses: [...TERMINAL], limit: 50 }),
-  ];
-  for (const t of rows) {
-    tasks[t.id] = {
-      ...toTaskHandle(t),
-      version: 1,
-      context: null, // 上下文经 db().getContext 读（工具路径单独处理）
-      messages: [],
-    };
-  }
-  const events = [];
-  for (const t of Object.keys(tasks)) {
-    for (const e of d.listEvents(t, 200)) {
-      events.push({ eventId: e.eventId, taskId: e.taskId, type: e.eventType, payload: e.payload?.note ?? (e.payload ? JSON.stringify(e.payload).slice(0, 300) : undefined), at: e.createdAt });
-    }
-  }
-  events.sort((a, b) => a.at - b.at);
-  return { tasks, events };
-}
-
-function saveTasks() { /* SQLite 同步落库，保留调用点兼容 */ }
-
 /** FNV-1a 32 位短哈希（幂等键用，非安全用途）。 */
 function fnv1a(s) {
   let h = 0x811c9dc5;
@@ -389,14 +361,6 @@ function fnv1a(s) {
     h = Math.imul(h, 0x01000193);
   }
   return (h >>> 0).toString(36);
-}
-
-/** 读-改-写原子操作：拿到最新投影，改完立即落库。 */
-function withTask(taskId, fn) {
-  const d = db();
-  const t = d.getTask(taskId);
-  if (!t) return null;
-  return fn(t, () => d.getTask(taskId));
 }
 
 function newTaskId() {
@@ -420,20 +384,75 @@ function emitEvent(_dbRef, taskId, type, _actor, payload) {
 }
 
 // ---------------------------------------------------------------------------
-// 通知账（任务书 6.4 / A10）：同 taskId 终态最多入账一次。
-// 实际送达靠 DSH 原生通道（job 结算唤醒 / subagent 父子回灌）——这里记的是
-// 「协调器欠不欠一条通知」的账，并给原生通知补上防重与补发依据。
-// 通知账落 SQLite idempotency 表（scope=notice）。
+// 终态通知（任务书 6.4 / A10）。
+//
+// 0.2.1 及以前的措辞是「已记账（仅台账；本插件不主动投递消息）」——
+// 那句话不假，但等于承认：lost 这类**协调器自产的终态没有任何原生事件**，
+// 前台实际收不到东西（审计 P2-9）。
+//
+// 0.2.2 起真投一次：
+//   宿主没有通用的「发通知」服务（inspect 全表查过，只有账户/语音那些被叫
+//   Notification 的无关项），但 `agents.get(sessionId)` 能拿到发起会话的活 agent，
+//   它上面有 followup/steer —— 和 task_append_message 用的是同一条通道。
+//   所以通知 = 向 owner 会话投一条 user 消息，内容是终态摘要。
+//
+// 三条约束：
+//   · 只投**协调器自产**的终态（lost / 超时取消这类没有原生事件可依的）；
+//     原生 job/subagent 结束本来就会回到前台，再投一条就是噪音。
+//   · 幂等：同 taskId+status 只投一次（idempotency 表 scope=notice）。
+//   · 投不出去就如实记下来，措辞不许退回到「已送达」。
 // ---------------------------------------------------------------------------
-function settleNotification(_dbRef, t) {
+function settleNotification(_dbRef, t, opts = {}) {
   const key = `notice:${t.id}:${t.status}`;
   const claimed = db().claimIdempotency('notice', key, Date.now());
   if (!claimed) return; // 已入过账
-  // 措辞必须准确（深度审计 P2-9）：这里只写幂等账 + 事件流水，**不投递任何消息**。
-  // job/subagent 正常结束靠 DSH 原生通道回前台；但 lost 这类协调器自产的终态
-  // 没有任何原生事件，前台实际收不到东西。
-  // 0.1.7 及以前这里写「通知已入账（原生通道送达）」—— 那是假的，已改。
-  emitEvent(null, t.id, 'task.notified', 'notifier', `终态 ${t.status} 已记账（仅台账；本插件不主动投递消息）`);
+
+  // 只有「协调器自产、前台收不到」的终态才主动投。
+  // 原生结算（subagent/end、jobs settled）已经在各自路径上回到前台了。
+  const selfProduced = opts.selfProduced === true;
+
+  if (!selfProduced) {
+    emitEvent(null, t.id, 'task.notified', 'notifier',
+      `终态 ${t.status} 已记账（由原生通道回前台，本插件不重复投递）`);
+    return;
+  }
+
+  // 真投：拿 owner 会话的活 agent，投一条摘要。
+  let delivered = false;
+  let why = '';
+  try {
+    const owner = String(t.ownerSessionId ?? '');
+    const agents = (() => {
+      try { return typeof ACTIVE_CTX?.get === 'function' ? ACTIVE_CTX.get('agents') : undefined; } catch { return undefined; }
+    })();
+    const ag = owner && agents ? agents.get(owner) : undefined;
+    if (!ag) {
+      why = '发起会话当前没有活的 agent';
+    } else if (typeof ag.followup !== 'function' && typeof ag.steer !== 'function') {
+      why = '发起会话的 agent 没有 followup/steer';
+    } else {
+      const msg = {
+        id: randomUUID(),
+        role: 'user',
+        content: [{
+          type: 'text',
+          text: `[后台任务终态] ${t.id}「${t.title ?? ''}」→ ${t.status}`
+            + `${t.errorSummary ? `（${String(t.errorSummary).slice(0, 120)}）` : ''}`,
+        }],
+        source: { kind: 'user' },
+      };
+      if (typeof ag.followup === 'function') ag.followup(msg);
+      else ag.steer(msg);
+      delivered = true;
+    }
+  } catch (e) {
+    why = String(e?.message ?? e).slice(0, 120);
+  }
+
+  emitEvent(null, t.id, 'task.notified', 'notifier',
+    delivered
+      ? `终态 ${t.status} 已投递到发起会话`
+      : `终态 ${t.status} 未能投递（${why || '未知原因'}），仅记账`);
 }
 
 // ---------------------------------------------------------------------------
@@ -467,6 +486,7 @@ export function apply(ctx, config) {
   const logger = typeof ctx.logger?.info === 'function' ? ctx.logger : null;
   const log = (msg) => logger?.info?.(`[task-coordinator] ${msg}`);
   _log = log; // 模块级函数（migrate 等）也要能打日志
+  ACTIVE_CTX = ctx;   // settleNotification 要给发起会话投消息，需要 agents 服务
 
   // -------------------------------------------------------------------------
   // 统一配置读取（0.2.1）：task_create 的限额、维护循环、保留天数都走这一份。
@@ -553,6 +573,31 @@ export function apply(ctx, config) {
    * （当时它会让只读工具写终态，审计 A1 已改回只读）。
    * 别照旧注释把 describe 那条接回来。
    */
+  /**
+   * 探活 miss 的连续计数（0.2.2，审计 P2-1）。
+   *
+   * 为什么要它：`ctx.agents.get` 有瞬时查不到活 agent 的时候（注册表切换、宿主忙）。
+   * 0.2.1 及以前是「这一轮查不到就判死」—— 而 `lost` 在 TERMINAL 里、不可逆，
+   * 一次抖动就能把正在跑的任务打死。
+   *
+   * 现在的规则：同一个任务连续 MISS_THRESHOLD 轮都查不到才落 lost。
+   * 中间只要有一轮查回来就清零。key 用任务 id，值存「连续 miss 次数 + 最后 miss 时间」。
+   * 内存态、进程重启就清空 —— 那是刻意的：重启后由「启动对账」统一裁决，
+   * 不该带着上一个进程的怀疑继续算。
+   */
+  const MISS_THRESHOLD = 2;
+  const missStreak = new Map();
+  // 早到的 subagent/end（0.2.2，审计 P2-3）：key 是会话 id，值 { at, info }。
+  // 子代理可能在前台调 task_register_delegation 之前就跑完，事件比绑定先到。
+  const earlyEnds = new Map();
+  const bumpMiss = (id, now) => {
+    const cur = missStreak.get(id);
+    const n = (cur?.n ?? 0) + 1;
+    missStreak.set(id, { n, last: now });
+    return n;
+  };
+  const clearMiss = (id) => { if (missStreak.has(id)) missStreak.delete(id); };
+
   function sweepOnce(d) {
     let swept = 0;
     const now = Date.now();
@@ -572,12 +617,24 @@ export function apply(ctx, config) {
         // 目的是让调用方区分「查不到」和「查询失败」。但这里没接，结果是一条子代理
         // 的瞬时查询异常会把整个 task_list 打崩。
         // 探活失败的正确处理是「这轮不下结论」：既不算死（不误杀），也不算活（下轮再试）。
+        let handle;
         try {
-          gone = !getAgentHandle(ctx, t);
+          handle = getAgentHandle(ctx, t);
         } catch (e) {
           log(`探活失败，本轮跳过 ${t.id}：${String(e?.message ?? e).slice(0, 120)}`);
           continue;
         }
+        if (handle) {
+          clearMiss(t.id);           // 查到了：之前的怀疑全部作废
+          continue;
+        }
+        // 查不到不等于死了（审计 P2-1）：要连续 N 轮都查不到才认。
+        const n = bumpMiss(t.id, now);
+        if (n < MISS_THRESHOLD) {
+          log(`探活 miss ${n}/${MISS_THRESHOLD}：${t.id}，本轮先不动`);
+          continue;
+        }
+        gone = true;
       } else {
         const born = Number(t.createdAt) || 0;
         const graceMs = LIMITS_READ().timeoutMinutes * 60_000;
@@ -591,14 +648,114 @@ export function apply(ctx, config) {
         status: 'lost',
         currentStage: 'reconciled',
         errorSummary: t.nativeSessionId
-          ? '探活兜底：原生 subagent 已回收，但没收到 subagent/end'
+          ? `探活兜底：连续 ${MISS_THRESHOLD} 轮查不到原生 subagent，且没收到 subagent/end`
           : '从未绑定到会话（无反查 id），超过宽限期仍未登记，按失联收掉',
         updatedAt: Date.now(),
         completedAt: Date.now(),
       });
       emitEvent(null, t.id, 'task.lost', 'reconciler', '探活兜底');
-      settleNotification(null, { id: t.id, status: 'lost' });
+      settleNotification(null, { id: t.id, status: 'lost', ownerSessionId: t.ownerSessionId, title: t.title }, { selfProduced: true });
+      clearMiss(t.id);            // 已经落终态，清掉计数
       swept += 1;
+    }
+    // 顺手清掉已经不在活动集里的陈旧计数（任务被取消/结算/删掉的情况）
+    const liveIds = new Set(d.listActive([...ACTIVE]).map((x) => x.id));
+    for (const id of missStreak.keys()) {
+      if (!liveIds.has(id)) missStreak.delete(id);
+    }
+    return swept;
+  }
+
+  /**
+   * job 的探活收尾（0.2.2，审计 P2-8）。
+   *
+   * 为什么需要：`sweepOnce` 只管 subagent。job 的终态本来靠 `ctx.jobs.events.subscribe`
+   * 的 settled 事件，但那个订阅在某些宿主/版本上不存在（上面那句日志就是这种情况），
+   * 或者事件漏了 —— 那样 job 会永远停在 running，永不超时、永不计入结算。
+   *
+   * 这里做的是：对活动中的 job，主动问一次原生 `ctx.jobs.get`。
+   *   - 拿到了且已是终态 → 就地落账（与 settled 事件走同一套映射）
+   *   - 拿到了还在跑 → 清计数
+   *   - 查不到（抛错/undefined）→ 连击计数，同 subagent 的规则：连续 N 轮才判 lost
+   *
+   * 用 caller = 台账 owner：这里和启动对账同理，是「替每条任务各自核实自己」，不是借身份看别人。
+   *
+   * @returns {number} 本轮补落的条数
+   */
+  function sweepJobsOnce(d) {
+    let swept = 0;
+    // 原生 job 状态 → 台账状态。未知状态返回 null（不猜，交给下一轮）。
+    const stMap = (s) => {
+      const v = String(s ?? '');
+      if (v === 'completed') return 'succeeded';
+      if (v === 'failed') return 'failed';
+      if (v === 'killed' || v === 'cancelled') return 'cancelled';
+      return null;
+    };
+    for (const t of d.listActive([...ACTIVE])) {
+      if (t.type !== 'job' || !t.nativeId) continue;
+      let view;
+      let err = null;
+      try {
+        view = ctx.jobs?.get?.(t.nativeId, t.ownerSessionId ?? undefined);
+      } catch (e) {
+        err = e;
+      }
+      if (err) {
+        // 查询本身失败 ≠ job 没了。按「不确定」处理，走连击计数。
+        const n = bumpMiss(t.id, Date.now());
+        if (n >= MISS_THRESHOLD) {
+          d.updateTaskFields(t.id, {
+            status: 'lost',
+            currentStage: 'reconciled',
+            errorSummary: `连续 ${MISS_THRESHOLD} 轮查不到原生 job（loast error: ${String(err?.message ?? err).slice(0, 100)}）`,
+            updatedAt: Date.now(),
+            completedAt: Date.now(),
+          });
+          emitEvent(null, t.id, 'task.lost', 'reconciler', 'job 探活兜底');
+          settleNotification(null, { id: t.id, status: 'lost', ownerSessionId: t.ownerSessionId, title: t.title }, { selfProduced: true });
+          clearMiss(t.id);
+          swept += 1;
+        }
+        continue;
+      }
+      if (!view) {
+        const n = bumpMiss(t.id, Date.now());
+        if (n >= MISS_THRESHOLD) {
+          d.updateTaskFields(t.id, {
+            status: 'lost',
+            currentStage: 'reconciled',
+            errorSummary: `连续 ${MISS_THRESHOLD} 轮查不到原生 job（注册表无此 id）`,
+            updatedAt: Date.now(),
+            completedAt: Date.now(),
+          });
+          emitEvent(null, t.id, 'task.lost', 'reconciler', 'job 探活兜底');
+          settleNotification(null, { id: t.id, status: 'lost', ownerSessionId: t.ownerSessionId, title: t.title }, { selfProduced: true });
+          clearMiss(t.id);
+          swept += 1;
+        }
+        continue;
+      }
+      const terminal = stMap(view.status);
+      if (!terminal) {
+        clearMiss(t.id);          // 还在跑
+        continue;
+      }
+      // 原生已终态但台账还在活动态 → 事件漏了，就地补账
+      d.updateTaskFields(t.id, {
+        status: terminal,
+        currentStage: 'settled',
+        resultSummary: terminal === 'succeeded' ? String(view.detail ?? '作业正常结束').slice(0, 300) : undefined,
+        errorSummary: terminal !== 'succeeded' ? String(view.detail ?? terminal).slice(0, 300) : undefined,
+        updatedAt: Date.now(),
+        completedAt: Date.now(),
+      });
+      emitEvent(null, t.id, terminal === 'succeeded' ? 'task.succeeded' : terminal === 'failed' ? 'task.failed' : 'task.cancelled',
+        'reconciler', `探活补账：原生已是 ${view.status}`);
+      settleNotification(null, { id: t.id, status: terminal, ownerSessionId: t.ownerSessionId, title: t.title }, { selfProduced: true });
+      clearMiss(t.id);
+      swept += 1;
+      log(`job 探活补账：${t.id} → ${terminal}（原生 ${view.status}）`);
     }
     return swept;
   }
@@ -704,8 +861,25 @@ export function apply(ctx, config) {
           // 光加 ?. 救不了 —— 而这句 catch 会把错吞掉，cwd 恒为 null，
           // 于是 job 在 0.2.2 上 100% 建不起来（2026-11-27 cwd 缺陷报告）。
           // 也不能往 inject 里加：加了 workingDirectory 会让整个插件不启动（报告 3.4 实测）。
-          const firstLine = objective.split('\n', 1)[0].trim();
-          const parts = firstLine.split(/\s+/);
+          // 命令行 = objective 的第一行。
+          // 首行为空必须先拦（0.2.2，审计 P1-2 残留）：objective 写成 "\nnpm test"
+          // （前面带个换行）时 firstLine 是空串，spawn 一条空命令，
+          // 子进程立刻退出、台账落 failed，而模型以为命令在跑。
+          const firstLine = String(objective ?? '').split('\n', 1)[0].trim();
+          if (!firstLine) {
+            d.updateTaskFields(id, {
+              status: 'failed',
+              errorSummary: 'objective 第一行为空（job 类型要求第一行是可执行命令）',
+              updatedAt: Date.now(),
+              completedAt: Date.now(),
+            });
+            emitEvent(null, id, 'task.failed', 'coordinator', 'objective 第一行为空');
+            return {
+              ok: false,
+              text: `建任务失败：objective 的第一行是空的。type=job 要求第一行必须是可执行命令`
+                + `（比如 \`npm run build\`），注意别在命令前留空行或换行。（taskId=${id}）`,
+            };
+          }
           // 可选服务查询：取不到返回 undefined，不抛。
           const svc = (name) => {
             try {
@@ -850,9 +1024,7 @@ export function apply(ctx, config) {
                 });
                 // 异步 error 不接住会把整个宿主进程打崩（audit P1-2）：cwd 被删、权限不足、
                 // 进程数上限都会走这条。接住并当成失败结算，别让它冒到 EventEmitter。
-                let spawnError = null;
                 child.on('error', (e) => {
-                  spawnError = e;
                   try { job.append(`\n[coordinator] spawn 失败：${String(e).slice(0, 200)}\n`, { channel: 'stderr' }); } catch { /* 推不进也不影响结算 */ }
                   try { job.updateProgress('启动失败'); } catch { /* 注册表无此方法 */ }
                 });
@@ -881,10 +1053,23 @@ export function apply(ctx, config) {
                   cancel() {
                     // 必须连子孙一起杀：只杀父 shell 的话，它下面的真进程会变孤儿继续跑，
                     // 台账标了 cancelled、进程还在（审计 P1-2 ③）。
+                    //
+                    // 用异步 spawn 而不是 execSync（0.2.2，审计 P1-2 残留）：
+                    // execSync 会**阻塞宿主事件循环**，杀一棵大进程树能卡住几百毫秒，
+                    // 期间整个 DSH 都不响应 —— 这是在一个「取消」动作上阻塞前台。
+                    // 换成 spawn + 不管它，杀进程本来也不需要在当前栈上等结果。
                     try {
                       if (!child.pid) return;
                       if (process.platform === 'win32') {
-                        execSync(`taskkill /T /F /PID ${child.pid}`, { stdio: 'ignore' });
+                        const killer = spawn('taskkill', ['/T', '/F', '/PID', String(child.pid)], {
+                          windowsHide: true,
+                          stdio: 'ignore',
+                          // 这里是独立调用，没有引号拼接，让 Node 正常转义即可
+                          windowsVerbatimArguments: false,
+                        });
+                        // 杀进程助手自己失败也不影响：子进程可能已经退出。
+                        killer.on('error', () => { /* 忽略 */ });
+                        if (typeof killer.unref === 'function') killer.unref();
                       } else {
                         // 非 Windows：spawn 时用了 detached，子进程自成进程组，
                         // 负 pid 就是整组（包括孙进程）。
@@ -969,8 +1154,12 @@ export function apply(ctx, config) {
         const d = db();
         // 兜底探活：**只有 task_list 会写台账**（2026-11-27 issue #1 A1 ——
         // describe 曾也调它，但那是只读工具写终态，会把瞬时查不到的活任务打死）。
+        // 0.2.2 起 subagent 和 job 两侧都扫：job 的结算事件在部分宿主上根本不存在，
+        // 不主动问一次就会永远停在 running（审计 P2-8）。
         const swept = sweepOnce(d);
         if (swept) log(`探活兜底：${swept} 条 subagent 任务原生已回收，补落 lost`);
+        const sweptJobs = sweepJobsOnce(d);
+        if (sweptJobs) log(`job 探活：${sweptJobs} 条已按原生状态补账`);
         // 只列自己的（审计 P0-3）：拿不到调用者身份时按原样全列（历史兼容）。
         const caller = callerSessionId(exec);
         const visible = (t) => {
@@ -1180,6 +1369,26 @@ export function apply(ctx, config) {
         );
         log(`委派登记：${tid} → agent ${agentName} session=${realSid ?? '未解析'}`);
 
+        // ---- 回放「早到的结算」（0.2.2，审计 P2-3）----
+        // 子代理可能在登记之前就跑完了：那一刻 task_register_delegation 还没写 nativeSessionId，
+        // subagent/end 匹配不上、被缓存起来。现在绑定好了，把那条补上。
+        //
+        // 这是 Mode B 的固有竞态，不是异常路径：短任务（"回两个字"这种）几乎必中。
+        // 不回放的话任务会一直 running，等一个已经发生过的事件。
+        let replayText = '';
+        if (realSid) {
+          const early = earlyEnds.get(String(realSid));
+          if (early) {
+            earlyEnds.delete(String(realSid));
+            // 重读一次拿最新行（上面的 updateTaskFields 刚写过）
+            const fresh = d.getTask(tid);
+            const st = settleFromSubagentEnd(d, toTaskHandle(fresh), String(early.info?.stopReason ?? ''));
+            replayText = `\n注意：这个子代理在登记之前就已经结束了（subagent/end 早到），`
+              + `已按早到的结束事件直接落 ${st}。`;
+            log(`早到结算回放：${tid} → ${st}`);
+          }
+        }
+
         // ---- 绑定后补投 pending 指令（0.2.0，审计 P1-5 ①）----
         // 以前 task_append_message 在没绑定时落一条 pending 并承诺「绑定后补投」，
         // 但这里根本没有 flush 逻辑 —— 消息永久卡在 pending，而且内容哈希幂等键
@@ -1228,7 +1437,12 @@ export function apply(ctx, config) {
           : '没能解析出会话 id（原生工具不返回、按名字反查也落空）：结算不靠事件，'
             + '会在 task_list 时按探活兜底落 lost；要确定状态请显式 task_cancel。';
         const flushText = flushLines.length ? `\n${flushLines.join('\n')}` : '';
-        return { ok: true, text: `已绑定：task ${tid} ↔ agent ${agentName}，任务进入 running。\n${tail}${flushText}` };
+        // 早到结算回放过的话，状态已经不是 running 了 —— 返回文案必须跟着改口，
+        // 不能嘴上说「任务进入 running」而库里已经是 succeeded（那是最典型的假汇报）。
+        const head = replayText
+          ? `已绑定：task ${tid} ↔ agent ${agentName}。`
+          : `已绑定：task ${tid} ↔ agent ${agentName}，任务进入 running。`;
+        return { ok: true, text: `${head}\n${tail}${flushText}${replayText}` };
       },
     }),
 
@@ -1582,6 +1796,13 @@ export function apply(ctx, config) {
           decisions: { type: 'array', items: { type: 'string' }, description: '关键决策，最多 20 条' },
           changedFiles: { type: 'array', items: { type: 'string' }, description: '改动过的文件，最多 20 条' },
           pending: { type: 'array', items: { type: 'string' }, description: '待办，最多 20 条' },
+          // 并发安全（0.2.2，审计 P2-5）：写之前先读一遍拿到版本号，写的时候带上它。
+          // 别人在你读之后改过 → 版本对不上 → 拒绝，而不是把对方的改动覆盖掉。
+          // 不传就沿用旧行为（读出当前版本再写），但那种情况下并发写会互相覆盖。
+          expectedVersion: {
+            type: 'number',
+            description: '期望的上下文版本号（读时返回的那个）。带上它，版本不符会被拒绝而不是覆盖别人的改动。',
+          },
         },
         required: ['taskId'],
       },
@@ -1607,10 +1828,25 @@ export function apply(ctx, config) {
 
         if (writing) {
           const ctxNow = d.getContext(tid) || { version: 0, done: [], decisions: [], changedFiles: [], pendingIssues: [] };
+          // 调用方带了 expectedVersion 就按它校验（0.2.2，审计 P2-5）。
+          // 不带则用「刚读到的版本」——那仍然是乐观锁，但只能防住「读到写之间被人改」的
+          // 极小窗口；两个代理各自读、各自写的情况必须靠显式传版本才能拦住。
+          const wantVersion = args?.expectedVersion !== undefined ? Number(args.expectedVersion) : null;
+          if (wantVersion !== null && (!Number.isFinite(wantVersion) || wantVersion < 0)) {
+            return { ok: false, text: `expectedVersion 必须是非负整数（收到 ${JSON.stringify(args.expectedVersion)}）。` };
+          }
+          const baseVersion = wantVersion !== null ? wantVersion : (ctxNow.version || 0);
+          if (wantVersion !== null && wantVersion !== (ctxNow.version || 0)) {
+            return {
+              ok: false,
+              text: `上下文版本冲突：你要基于 v${wantVersion} 写，但库里已是 v${ctxNow.version || 0}。`
+                + `先用 task_context 读一遍（不带内容字段）拿最新版本，再带上它重写。`,
+            };
+          }
           // 落地版上下文语义保持：stage/decisions/changedFiles/pending 四字段，乐观锁版本号
           const next = {
             taskId: tid,
-            version: (ctxNow.version || 0) + 1,
+            version: baseVersion + 1,
             objective: row.objective,
             currentStage: args?.stage !== undefined ? String(args.stage).slice(0, 200) : (ctxNow.currentStage ?? ctxNow.stage),
             done: ctxNow.done ?? [],
@@ -1633,7 +1869,8 @@ export function apply(ctx, config) {
             return { ok: false, text: `上下文太大（${bytes} 字节 > 8192，只算 stage/decisions/changedFiles/pending），缩一缩再写。` };
           }
           // 乐观锁写：版本冲突拒绝
-          const wrote = d.updateContextOptimistic(ctxNow.version || 0, next);
+          // 乐观锁写：用 baseVersion（调用方指定的或刚读到的），版本不符就拒。
+          const wrote = d.updateContextOptimistic(baseVersion, next);
           if (!wrote) {
             return { ok: false, text: `上下文版本冲突（库里已是 v${d.getContext(tid)?.version}），重读再写。` };
           }
@@ -1836,7 +2073,7 @@ export function apply(ctx, config) {
           completedAt: Date.now(),
         });
         emitEvent(null, t.id, 'task.lost', 'coordinator', '重启后原生执行单元已不存在（台账投影修正，非真实失败）');
-        settleNotification(null, { id: t.id, status: 'lost' });
+        settleNotification(null, { id: t.id, status: 'lost', ownerSessionId: t.ownerSessionId, title: t.title }, { selfProduced: true });
         fixed += 1;
       }
     }
@@ -1849,6 +2086,62 @@ export function apply(ctx, config) {
     log(`启动对账失败（不阻塞）：${String(e).slice(0, 160)}`);
   }
 
+
+  // -------------------------------------------------------------------------
+  // subagent/end 的结算（0.2.2）：抽成函数，事件路径与「早到回放」共用同一套。
+  //
+  // 为什么必须共用：如果回放单独写一份，两份的 stopReason 映射迟早会漂开，
+  // 而这条映射是「假成功/假失败」的分界线。
+  // -------------------------------------------------------------------------
+  function settleFromSubagentEnd(d, t, raw) {
+    // A07 会合规则：cancel_requested 状态下收到原生结束事件，无论 stopReason 是什么
+    // （常见 aborted/aborted:true，不含 cancel 字样），都落 cancelled——
+    // 协调器自己请求过取消，结束就是确认，事实链完整。
+    //
+    // 其余情况按宿主**真实枚举**映射（0.2.0）。
+    // 本机 0.2.1-rc.4 的 asar 里 SubagentStopReasonMap 原文：
+    //   { completed:'completed', aborted:'aborted', error:'error',
+    //     'max-tokens':'max-tokens', refusal:'refusal' }
+    // 只有 completed 算正常收尾；aborted 是取消；error / max-tokens / refusal 都是失败。
+    //
+    // 0.1.7 的白名单只认 completed/end_turn/stop/success 那几个词，
+    // 而宿主实际不发那些词 —— 结果是 completed 被当成 unknown 落 failed（假失败）。
+    // 0.2.0 反过来：空 stopReason 也当「宿主没给原因」而不是失败，
+    // 只有明确在失败集合里的才落 failed，并且把原始词写进 errorSummary。
+    const cancelled = t.status === 'cancel_requested' || /^(aborted|cancel|canceled|cancelled)$/i.test(raw.trim());
+    // 明确「正常收尾」：completed（宿主枚举）+ 若干历史/其他版本用词
+    const OK_REASONS = /^(completed|end_turn|stop|stop_sequence|success|succeeded|done)$/i;
+    // 明确「失败」：宿主枚举里的非正常终止词。
+    // 连字符与下划线两种写法都收（审计提醒过 budget-exceeded / context-length），
+    // 外加 interrupted —— 它不是正常收尾。
+    const FAIL_REASONS = /^(error|max-tokens|max_tokens|max-turns|max_turns|timeout|refusal|interrupted|budget[-_]exceeded|context[-_]length)$/i;
+    const trimmed = raw.trim();
+    // 空串 / 未知词 = 「宿主没给出可判定的原因」。这种不能算失败（那是编造事实），
+    // 也不能算成功（那也是编造）——落 succeeded 但把「未给出原因」写进 resultSummary，
+    // 让读的人知道这条结算的依据是「事件到了且没有报错」，不是「确认成功」。
+    const looksOk = OK_REASONS.test(trimmed);
+    const looksBad = FAIL_REASONS.test(trimmed);
+    const failed = !cancelled && looksBad;
+    const status = cancelled ? 'cancelled' : failed ? 'failed' : 'succeeded';
+    const unknownReason = !cancelled && !looksOk && !looksBad;
+    d.updateTaskFields(t.id, {
+      status,
+      currentStage: 'settled',
+      // 失败的把原始 stopReason 留下来，别只说「失败了」
+      errorSummary: failed ? `end: ${raw || '(空 stopReason)'}`.slice(0, 200) : (cancelled ? (t.errorSummary ?? '执行器确认停止') : undefined),
+      resultSummary: cancelled ? undefined
+        : failed ? undefined
+          : unknownReason
+            ? `子代理已结束（原生 subagent/end；stopReason=${trimmed || '未给出'}，非失败词）`
+            : '子代理已结束（原生 subagent/end）',
+      updatedAt: Date.now(),
+      completedAt: Date.now(),
+    });
+    emitEvent(null, t.id, failed ? 'task.failed' : cancelled ? 'task.cancelled' : 'task.succeeded', 'executor', raw.slice(0, 200));
+    settleNotification(null, { id: t.id, status });
+    log(`结算：${t.id} → ${status}（subagent/end）`);
+    return status;
+  }
 
   // -------------------------------------------------------------------------
   // 原生事件订阅 —— subagent 的真源在 DSH，台账只是投影（任务书 4.2 / 5.4）。
@@ -1873,52 +2166,26 @@ export function apply(ctx, config) {
       //   1. 任务累积超 500 条后，活动任务掉出窗口 → 事件到了也匹配不上，结算永久丢失（审计 P1-4）；
       //   2. 旧写法会命中已终态的历史记录然后提前 return，漏掉真正活跃的那条。
       const t = d.findActiveByNative(sid, [...ACTIVE], 'subagent');
-      if (!t) return;
+      if (!t) {
+        // Mode B 秒结竞态（0.2.2，审计 P2-3）：
+        // 子代理可能在前台还没来得及调 task_register_delegation 之前就跑完了 ——
+        // 事件先到、绑定后到。以前这里直接 return，事件被丢掉，
+        // 那条任务就永远停在 running，等一个已经发生过的结束事件。
+        //
+        // 现在记进「早到结算」缓冲区，绑定那一刻回放。
+        // 只留一段短时间（10 分钟）的东西，不做持久化：这是竞态窗口，
+        // 不是长期状态；过期就丢，由探活兜底处理。
+        earlyEnds.set(sid, { at: Date.now(), info: { stopReason: info?.stopReason } });
+        // 顺手清掉过期项，避免长期挂着
+        for (const [k, v] of earlyEnds) {
+          if (Date.now() - v.at > 10 * 60_000) earlyEnds.delete(k);
+        }
+        log(`subagent/end 早于绑定到达（${sid}），已缓存，等 register_delegation 回放`);
+        return;
+      }
+      // 结束原因：宿主只给 stopReason；其余几个兜底是历史/其他版本的字段名。
       const raw = String(info?.stopReason ?? info?.status ?? info?.reason ?? info?.outcome ?? '');
-      // A07 会合规则：cancel_requested 状态下收到原生结束事件，无论 stopReason 是什么
-      // （常见 aborted/aborted:true，不含 cancel 字样），都落 cancelled——
-      // 协调器自己请求过取消，结束就是确认，事实链完整。
-      //
-      // 其余情况按宿主**真实枚举**映射（0.2.0）。
-      // 本机 0.2.1-rc.4 的 asar 里 SubagentStopReasonMap 原文：
-      //   { completed:'completed', aborted:'aborted', error:'error',
-      //     'max-tokens':'max-tokens', refusal:'refusal' }
-      // 只有 completed 算正常收尾；aborted 是取消；error / max-tokens / refusal 都是失败。
-      //
-      // 0.1.7 之前的白名单只认 completed/end_turn/stop/success 那几个词，
-      // 而宿主实际不发那些词 —— 结果是 completed 被当成 unknown 落 failed（假失败）。
-      // 0.2.0 反过来：空 stopReason 也当「宿主没给原因」而不是失败，
-      // 只有明确在失败集合里的才落 failed，并且把原始词写进 errorSummary。
-      const cancelled = t.status === 'cancel_requested' || /^(aborted|cancel|canceled|cancelled)$/i.test(raw.trim());
-      // 明确「正常收尾」：completed（宿主枚举）+ 若干历史/其他版本用词
-      const OK_REASONS = /^(completed|end_turn|stop|stop_sequence|success|succeeded|done)$/i;
-      // 明确「失败」：宿主枚举里的非正常终止词
-      const FAIL_REASONS = /^(error|max-tokens|max_tokens|max-turns|max_turns|timeout|refusal|budget[_]exceeded|context[_]length)$/i;
-      const trimmed = raw.trim();
-      // 空串 / 未知词 = 「宿主没给出可判定的原因」。这种不能算失败（那是编造事实），
-      // 也不能算成功（那也是编造）——落 succeeded 但把「未给出原因」写进 resultSummary，
-      // 让读的人知道这条结算的依据是「事件到了且没有报错」，不是「确认成功」。
-      const looksOk = OK_REASONS.test(trimmed);
-      const looksBad = FAIL_REASONS.test(trimmed);
-      const failed = !cancelled && looksBad;
-      const status = cancelled ? 'cancelled' : failed ? 'failed' : 'succeeded';
-      const unknownReason = !cancelled && !looksOk && !looksBad;
-      d.updateTaskFields(t.id, {
-        status,
-        currentStage: 'settled',
-        // 失败的把原始 stopReason 留下来，别只说「失败了」
-        errorSummary: failed ? `end: ${raw || '(空 stopReason)'}`.slice(0, 200) : (cancelled ? (t.errorSummary ?? '执行器确认停止') : undefined),
-        resultSummary: cancelled ? undefined
-          : failed ? undefined
-            : unknownReason
-              ? `子代理已结束（原生 subagent/end；stopReason=${trimmed || '未给出'}，非失败词）`
-              : '子代理已结束（原生 subagent/end）',
-        updatedAt: Date.now(),
-        completedAt: Date.now(),
-      });
-      emitEvent(null, t.id, failed ? 'task.failed' : cancelled ? 'task.cancelled' : 'task.succeeded', 'executor', raw.slice(0, 200));
-      settleNotification(null, { id: t.id, status });
-      log(`结算：${t.id} → ${status}（subagent/end）`);
+      settleFromSubagentEnd(d, t, raw);
     });
     if (typeof offEnd === 'function') disposers.push(offEnd);
     log('已订阅 subagent/end');
@@ -1955,13 +2222,14 @@ export function apply(ctx, config) {
           completedAt: Date.now(),
         });
         emitEvent(null, t.id, terminal === 'succeeded' ? 'task.succeeded' : terminal === 'failed' ? 'task.failed' : 'task.cancelled', 'executor', String(detail ?? '').slice(0, 200));
-        settleNotification(null, { id: t.id, status: terminal });
+        settleNotification(null, { id: t.id, status: terminal, ownerSessionId: t.ownerSessionId, title: t.title }, { selfProduced: true });
         log(`结算：${t.id} → ${terminal}`);
       });
       if (typeof off === 'function') disposers.push(off);
       log('结算订阅已挂（onSettled）');
     } else {
-      log('ctx.jobs.onSettled 不存在——结算回收走 task_describe 的 readOutput 兜底，签名待实测');
+      log('ctx.jobs.events.subscribe 不存在——收不到结算事件；'
+        + 'job 的终态只能靠 task_list / task_describe 读时探活（见 sweepJobsOnce），不会自动落账');
     }
   } catch (e) {
     log(`结算订阅挂载失败（不阻塞）：${String(e).slice(0, 160)}`);
@@ -2011,7 +2279,7 @@ export function apply(ctx, config) {
               completedAt: Date.now(),
             });
             emitEvent(null, t.id, 'task.lost', 'coordinator', 'deadline 超时 + 原生已回收');
-            settleNotification(null, { id: t.id, status: 'lost' });
+            settleNotification(null, { id: t.id, status: 'lost', ownerSessionId: t.ownerSessionId, title: t.title }, { selfProduced: true });
             changed += 1;
             continue;
           }
@@ -2030,6 +2298,16 @@ export function apply(ctx, config) {
       }
       if (changed) {
         log(`超时清账：${changed} 条任务过 deadline，已请求取消`);
+      }
+
+      // ---- job 探活（0.2.2，审计 P2-8）----
+      // 放在超时扫描之后、历史清理之前：先让漏了结算事件的 job 落账，
+      // 免得它们被当成「还在跑」一直占着配额。
+      try {
+        const sj = sweepJobsOnce(d);
+        if (sj) log(`维护循环：job 探活补账 ${sj} 条`);
+      } catch (e) {
+        log(`job 探活失败（不阻塞）：${String(e).slice(0, 120)}`);
       }
 
       // ---- 历史清理（0.2.0，审计 P1-4）----

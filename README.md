@@ -185,7 +185,7 @@ background jobs unavailable: no job controller serves this agent
 - 子代理跑到一半追加指令，它在最终回复里原样带上了那段内容，`turn/end: completed`
 - 取消后进程树无残留
 - 30 分钟连续跑，1800 个包一个不丢
-- 重启回收：失联任务标 `lost` 并发通知，不复活旧记录
+- 重启回收：失联任务标 `lost`，并把终态通知投回发起会话（0.2.2 起真投；以前只记账不投，那句话是假的）
 
 **接口契约核验 15 项全部 VERIFIED**，在 `docs/接口核验表.md`。那份表里还记了两个「看着像问题其实不是」的坑：
 
@@ -241,12 +241,12 @@ background jobs unavailable: no job controller serves this agent
 | `stopReason` 空串落 `failed` | 假失败（和以前假成功一样糟） | 按宿主真实枚举映射，空串落 `succeeded` 但注明「未给出原因」 |
 | **`cmd /s /c` 把引号拼成字面量**（新发现） | 任何带引号/带空格的命令都报 `Cannot find module '..."..."'` | `spawn` 加 `windowsVerbatimArguments`（仅 danger-full-access 分支） |
 
-测试三套，**88 项全绿**（0.2.1 起）：
+测试三套，**110 项全绿**（0.2.2 起）：
 
 ```
 主回归      16/16
 下游补丁     9/9
-专项       63/63
+专项       85/85
 ```
 
 其中几条是专门设计成「能反驳自己」的——比如断言旧 `listTasks({limit:500})` 写法在 601 条台账下**确实漏掉活动任务**，用来证明修的是真 bug。迁移那条用本机真实旧库（含 2.1 MB WAL）跑过：29 任务 / 53 事件 / 5 消息全保留。
@@ -272,6 +272,38 @@ background jobs unavailable: no job controller serves this agent
 **一处取舍要说明**：核验报告建议对 `given` 严格校验，我一开始写成「必须是 UUID」，结果把 `sess-F1` 这种合法短 id 也打断了，补投直接失效——这是测试逼出来的。现在只排除明显是话不是 id 的（空、含空格、纯中文、超短），其余接受但算「未核实」。
 
 ---
+
+## 九点七、0.2.2 改了什么
+
+0.2.1 之后把核验报告剩下的「未修 / 半修」九条全部处理掉：
+
+| 问题 | 后果 | 现状 |
+|---|---|---|
+| `execSync('taskkill …')` | **同步阻塞宿主事件循环**，杀大进程树能卡住几百毫秒 | 改异步 spawn + unref |
+| 首行为空的 objective 未拦 | spawn 一条空命令，落 failed 而模型以为在跑 | 建任务前拦下 |
+| `sweepOnce` 单次 miss 就判死 | **一次探活抖动就把在跑的任务打死，`lost` 不可逆** | 连续两轮才认，查回来就清零 |
+| Mode B 秒结竞态 | 事件比绑定先到就被丢弃 → 短任务永远停在 running | 缓存并回放，走同一套结算映射 |
+| 失联 job 无运行期恢复 | 结算事件缺失时永远 running，永不超时 | 新增 `sweepJobsOnce`，挂 task_list + 维护循环 |
+| `task_context` 无 `expectedVersion` | 两个代理各自读写，后者静默覆盖前者 | 暴露版本参数，冲突直接拒 |
+| `settleNotification` 只记账 | `lost` 这类自产终态前台收不到 | 真投到发起会话（幂等、只投自产的） |
+| 死代码 | `loadTasks`/`saveTasks`/`withTask`/`SCHEMA`/`spawnError` | 全删 |
+
+顺带删了一句假日志：`ctx.jobs.onSettled 不存在——走 readOutput 兜底`。**根本没有那个兜底**，`readAt` 只读不写账。
+
+### 关于通知这件事
+
+宿主的服务表里**没有**通用「发通知」服务（inspect 全表查过）。但 `agents.get(sessionId)` 能拿到发起会话的活 agent，上面有 `followup`，和 `task_append_message` 同一条通道。所以通知 = 往 owner 会话投一条摘要消息。
+
+只在**协调器自产、前台本来收不到**的终态上投（探活 lost / 重启对账 / 超时清账）。原生 job/subagent 结束本来就会回到前台，再投一条是噪音。
+
+### 一个反直觉的细节
+
+`windowsVerbatimArguments` 这个选项在不同上下文里答案相反：
+
+- 我们自己拼 `cmd /d /s /c <原文>` → **必须** true（否则引号变字面量）
+- 独立 argv 调 `taskkill` → **必须** false（否则路径被劈开）
+
+不能一刀切，按 argv 的来源决定。
 
 ## 十、许可
 
