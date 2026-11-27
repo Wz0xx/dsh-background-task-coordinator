@@ -1,8 +1,4 @@
 - insert:
     - id: background-task-coordinator
       name: dsh-background-task-coordinator
-      config:
-        # 子智能体跑完自动归档（把子会话从面板列表里收走）。不想让它动就设 false。
-        autoArchiveSubagents: true
-        # 归档时是否顺带停掉子会话的运行中工作。任务已终态，一般不需要。
-        archiveStopActivity: false
+      config: {}

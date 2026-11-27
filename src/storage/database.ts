@@ -182,7 +182,6 @@ export class CoordinatorDatabase {
         | "errorSummary"
         | "completedAt"
         | "updatedAt"
-        | "labels"
       >
     >,
   ): void {
@@ -198,8 +197,6 @@ export class CoordinatorDatabase {
       errorSummary: ["error_summary", fields.errorSummary],
       completedAt: ["completed_at", fields.completedAt],
       updatedAt: ["updated_at", fields.updatedAt],
-      // labels 是 JSON 列：对象要先序列化，否则绑定会塞进 "[object Object]"
-      labels: ["labels", fields.labels === undefined ? undefined : JSON.stringify(fields.labels)],
     };
     for (const [k, v] of Object.entries(map)) {
       if (v[1] !== undefined) {
