@@ -1266,7 +1266,110 @@ const rm = (p) => { try { fs.rmSync(p, { recursive: true, force: true, maxRetrie
   rm(home);
 }
 
+// ---------------------------------------------------------------------------
+// 20. 0.2.4：config.profile 决定台账目录（宿主不传环境变量，只能靠它）
+// ---------------------------------------------------------------------------
+{
+  // 20.1–20.5 纯函数：dataDir 的来源优先级
+  const src = fs.readFileSync(new URL('../index.js', import.meta.url), 'utf8');
+  const s0 = src.indexOf('function dataDir(configHint) {');
+  const s1 = src.indexOf('function dbPath(configHint) {');
+  if (s0 < 0 || s1 < 0) throw new Error('dataDir 未找到');
+  const HOME_DATA = path.join(os.homedir(), '.dsh', 'background-task-coordinator');
+  const mkDataDir = new Function('path', 'HOME_DATA',
+    src.slice(s0, s1) + '; return dataDir;')(path, HOME_DATA);
+
+  const savedEnv = { D: process.env.DSH_PROFILE_DIR, P: process.env.DSH_PROFILE };
+  // 模拟「插件进程里读不到环境变量」——这是实测的真实情况
+  delete process.env.DSH_PROFILE_DIR;
+  delete process.env.DSH_PROFILE;
+
+  ok('20.1 config.profile 生效（env 为空时）',
+    path.basename(mkDataDir({ profile: 'desktop' })) === 'desktop',
+    path.basename(mkDataDir({ profile: 'desktop' })));
+  ok('20.2 profileName 也认',
+    path.basename(mkDataDir({ profileName: 'mytest' })) === 'mytest');
+  ok('20.3 都没有时退回 default（0.2.3 的 bug 现场）',
+    path.basename(mkDataDir({})) === 'default', path.basename(mkDataDir({})));
+
+  // 20.4 config 优先级高于 env
+  process.env.DSH_PROFILE_DIR = path.join(os.homedir(), 'x', 'profiles', 'fromenv');
+  ok('20.4 config 压过 env', path.basename(mkDataDir({ profile: 'fromconfig' })) === 'fromconfig',
+    path.basename(mkDataDir({ profile: 'fromconfig' })));
+  // 20.5 没有 config 时 env 兜底
+  ok('20.5 无 config 时 env 兜底', path.basename(mkDataDir({})) === 'fromenv',
+    path.basename(mkDataDir({})));
+
+  if (savedEnv.D !== undefined) process.env.DSH_PROFILE_DIR = savedEnv.D; else delete process.env.DSH_PROFILE_DIR;
+  if (savedEnv.P !== undefined) process.env.DSH_PROFILE = savedEnv.P; else delete process.env.DSH_PROFILE;
+
+  // 20.6 打包配置里必须带 profile（否则重启后还是落到 default）
+  const yml = fs.readFileSync(new URL('../cordis.patch.yml', import.meta.url), 'utf8');
+  ok('20.6 cordis.patch.yml 里有 profile', /^\s+profile:\s*\S+/m.test(yml),
+    (yml.match(/profile:.*/) ?? ['(无)'])[0].trim());
+}
+
+// ---------------------------------------------------------------------------
+// 21. 0.2.4：v2 库能迁到 v3，且约束真的生效
+// ---------------------------------------------------------------------------
+{
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'v024-mig-'));
+  const oldDb = path.join(home, 'tasks.db');
+  // 造一个 0.2.0 形态的库（有联合唯一、但缺 FK 与 CHECK）
+  {
+    const { DatabaseSync } = await import('node:sqlite');
+    const w = new DatabaseSync(oldDb);
+    w.exec(`
+      CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+      CREATE TABLE tasks (
+        id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL, owner_session_id TEXT NOT NULL,
+        type TEXT NOT NULL, native_id TEXT, native_session_id TEXT, title TEXT NOT NULL,
+        objective TEXT NOT NULL, status TEXT NOT NULL, current_stage TEXT, progress_summary TEXT,
+        result_summary TEXT, error_summary TEXT, priority INTEGER NOT NULL DEFAULT 5,
+        retry_of TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+        completed_at INTEGER, children TEXT, labels TEXT);
+      CREATE TABLE task_messages (
+        message_id TEXT PRIMARY KEY, task_id TEXT NOT NULL,
+        sender TEXT NOT NULL, content TEXT NOT NULL, idempotency_key TEXT NOT NULL,
+        status TEXT NOT NULL, channel TEXT, reason TEXT,
+        created_at INTEGER NOT NULL, delivered_at INTEGER);
+      CREATE UNIQUE INDEX uq_messages_task_key ON task_messages(task_id, idempotency_key);
+    `);
+    w.prepare("INSERT INTO meta VALUES (?,?)").run('schema.task_messages.unique', '2');
+    w.prepare("INSERT INTO tasks (id,conversation_id,owner_session_id,type,title,objective,status,priority,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)")
+      .run('t1', 'c', 's', 'job', 'x', 'echo', 'succeeded', 5, 1, 1);
+    w.prepare("INSERT INTO task_messages (message_id,task_id,sender,content,idempotency_key,status,created_at) VALUES (?,?,?,?,?,?,?)")
+      .run('m1', 't1', 'user', 'hi', 'k1', 'delivered', 1);
+    w.close();
+  }
+
+  const { CoordinatorDatabase } = await import(`${ROOT}/lib/storage/database.js`);
+  const db = new CoordinatorDatabase(oldDb);
+  const msql = db.db.prepare("SELECT sql FROM sqlite_master WHERE name='task_messages'").get().sql;
+  const v = db.db.prepare("SELECT value FROM meta WHERE key='schema.task_messages.unique'").get()?.value;
+  ok('21.1 v2 → v3 版本推进', Number(v) === 3, `v=${v}`);
+  ok('21.2 迁移后补上了外键', /REFERENCES\s+tasks/i.test(msql));
+  ok('21.3 迁移后补上了 CHECK', /CHECK\s*\(\s*status/i.test(msql));
+  ok('21.4 老数据保留', db.stats().messages === 1 && db.stats().tasks === 1, JSON.stringify(db.stats()));
+
+  let fkBlocked = false;
+  try {
+    db.db.prepare("INSERT INTO task_messages (message_id,task_id,sender,content,idempotency_key,status,created_at) VALUES (?,?,?,?,?,?,?)")
+      .run('orphan', 'nope', 'user', 'x', 'k9', 'pending', 1);
+  } catch { fkBlocked = true; }
+  let ckBlocked = false;
+  try {
+    db.db.prepare("INSERT INTO task_messages (message_id,task_id,sender,content,idempotency_key,status,created_at) VALUES (?,?,?,?,?,?,?)")
+      .run('bad', 't1', 'user', 'x', 'k10', 'BOGUS', 1);
+  } catch { ckBlocked = true; }
+  ok('21.5 孤儿消息插不进去', fkBlocked);
+  ok('21.6 非法 status 插不进去', ckBlocked);
+  db.close();
+  rm(home);
+}
+
 console.log('=== 0.2.0 专项 ===');
-console.log(P.join('\n'));const pass = P.filter((x) => x.startsWith('✅')).length;
+console.log(P.join('\n'));
+const pass = P.filter((x) => x.startsWith('✅')).length;
 console.log(`\n通过 ${pass}/${P.length}`);
 process.exit(P.some((x) => x.startsWith('❌')) ? 1 : 0);

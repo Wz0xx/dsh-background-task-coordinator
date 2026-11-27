@@ -2,9 +2,18 @@
     - id: background-task-coordinator
       name: dsh-background-task-coordinator
       config:
-        # 0.2.0 起 apply(ctx, config) 真的读这份配置；不写就是下面这几个默认值。
-        # （0.1.x 的 apply 只收一个参数，写在这里的键会被静默忽略。）
+        # 本 profile 的名字（0.2.4 起必需）。
         #
+        # 为什么必须手写：插件进程里读不到 DSH_PROFILE_DIR / DSH_PROFILE ——
+        # 主进程环境变量是对的，但宿主没把这两个键传给插件所在的 host 子进程。
+        # 于是 0.2.0–0.2.3 的 dataDir() 一直落到 background-task-coordinator\default\，
+        # 而真正的台账在 desktop\。日志原文：
+        #   已注册 8 个工具；数据目录 ...\background-task-coordinator\default
+        # 宿主启动参数里明确有 {"profile":"desktop"}，但那也没进 config。
+        #
+        # 换 profile 或改 profile 名时，这一行要一起改。
+        profile: desktop
+
         # retentionDays：终态任务完成超过这么多天就删（连事件/消息/幂等账一起清）。
         #   默认 30。设 0 关掉清理——要长期留证据时才这么干。
         #   以前这个清理根本没被调用过，台账只增不减，到 500 条之后结算事件会开始丢（审计 P1-4）。

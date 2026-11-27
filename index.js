@@ -61,11 +61,31 @@ const HOME_DATA = path.join(os.homedir(), '.dsh', 'background-task-coordinator')
  *   - 都没有（直接 node 跑测试）→ `default`。
  * 旧库不自动搬：串台路径不清不楚，搬错比不搬更糟。要留老数据就手动 copy 到新目录。
  */
-function dataDir() {
-  const raw = String(process.env.DSH_PROFILE_DIR ?? '').trim();
+function dataDir(configHint) {
+  // 三级来源（0.2.4 修：前两级在宿主里都拿不到）。
+  //
+  // 实测记录：宿主启动参数明确是 {"profile":"desktop"}，主进程环境变量里
+  // DSH_PROFILE_DIR / DSH_PROFILE 也都对，但**插件在 host 子进程里读 process.env 时**
+  // 这两个键是空的 —— 所以 0.2.0–0.2.3 全部落到了 `default`。日志原文：
+  //   数据目录 C:\Users\...\background-task-coordinator\default
+  // 也就是说这两个变量宿主自己用，没传给插件所在进程。
+  //
+  // 真值顺序：
+  //   ① config 里宿主传进来的 profile（apply 第二参）
+  //   ② process.env.DSH_PROFILE_DIR（宿主真传了就用）
+  //   ③ process.env.DSH_PROFILE / DSH_PROFILE_NAME
+  //   ④ 都没有（`node tests/...` 直接跑）→ default
+  const fromConfig = String(
+    (configHint && typeof configHint === 'object'
+      ? (configHint.profile ?? configHint.profileName)
+      : '') ?? '',
+  ).trim();
+  const rawDir = String(process.env.DSH_PROFILE_DIR ?? '').trim();
   let tag = '';
-  if (raw) {
-    tag = path.basename(raw.replace(/[\\/]+$/, ''));
+  if (fromConfig) {
+    tag = fromConfig;
+  } else if (rawDir) {
+    tag = path.basename(rawDir.replace(/[\\/]+$/, ''));
   } else {
     tag = String(process.env.DSH_PROFILE ?? process.env.DSH_PROFILE_NAME ?? '').trim();
   }
@@ -74,8 +94,8 @@ function dataDir() {
   return path.join(HOME_DATA, tag);
 }
 
-function dbPath() {
-  return path.join(dataDir(), 'tasks.db');
+function dbPath(configHint) {
+  return path.join(dataDir(configHint), 'tasks.db');
 }
 
 // 子进程在中文 Windows 上默认吐 GBK。0.2.0 之前是「首个 chunk 试解一次就永久锁定编码」，
@@ -190,12 +210,16 @@ let _sqlite = null; // CoordinatorDatabase 单例
 // 模块级日志钩子：apply() 时注入，供 migrate 等模块级函数使用
 let _log = () => {};
 // 模块级 ctx 引用：settleNotification 这类模块级函数要给发起会话投消息，
-// 需要 agents 服务。apply() 时注入，dispose 时清掉（不留悬挂引用）。
+// 需要 agents 服务。apply() 时注入，dispose 时清掉（不留悬挂引用）：
 let ACTIVE_CTX = null;
+// 模块级 profile 提示：apply(config) 时从宿主配置里取，db()/dataDir() 要用。
+// 为什么不用 process.env：实测宿主**没把** DSH_PROFILE_DIR 传给插件所在进程
+// （主进程有、插件进程空），只靠环境变量会一直落到 default/（0.2.4 修）。
+let _profileHint = '';
 
 function db() {
   if (!_sqlite) {
-    _sqlite = new CoordinatorDatabase(dbPath());
+    _sqlite = new CoordinatorDatabase(dbPath({ profile: _profileHint }));
     migrateJsonFileIfNeeded();
   }
   return _sqlite;
@@ -203,7 +227,7 @@ function db() {
 
 /** 旧 tasks.json → SQLite 一次性迁移。 */
 function migrateJsonFileIfNeeded() {
-  const f = path.join(dataDir(), 'tasks.json');
+  const f = path.join(dataDir({ profile: _profileHint }), 'tasks.json');
   let raw;
   try {
     raw = JSON.parse(fs.readFileSync(f, 'utf8'));
@@ -506,6 +530,20 @@ export function apply(ctx, config) {
   const log = (msg) => logger?.info?.(`[task-coordinator] ${msg}`);
   _log = log; // 模块级函数（migrate 等）也要能打日志
   ACTIVE_CTX = ctx;   // settleNotification 要给发起会话投消息，需要 agents 服务
+  // profile 提示：宿主在启动参数里明确给了（`{"profile":"desktop"}`），
+  // 但没通过环境变量传给插件进程。这里从 config 取，取不到再退回环境变量。
+  _profileHint = String(
+    (PLUGIN_CFG.profile ?? PLUGIN_CFG.profileName ?? '') || '',
+  ).trim();
+  // 打出实际用到的目录（0.2.4）：这一行是排查「数据落到 default/」的唯一线索，
+  // 以前只在注册工具时打一次，且不带来源信息。
+  {
+    const resolved = dataDir({ profile: _profileHint });
+    const src = _profileHint ? 'config.profile'
+      : (process.env.DSH_PROFILE_DIR ? 'env.DSH_PROFILE_DIR'
+        : (process.env.DSH_PROFILE ? 'env.DSH_PROFILE' : 'fallback(default)'));
+    log(`台账目录：${resolved}（来源：${src}）`);
+  }
 
   // -------------------------------------------------------------------------
   // 统一配置读取（0.2.1）：task_create 的限额、维护循环、保留天数都走这一份。
@@ -2057,7 +2095,7 @@ export function apply(ctx, config) {
     }),
   ];
 
-  log(`已注册 8 个工具（7 任务 + task_probe 诊断）；数据目录 ${dataDir()}`);
+  log(`已注册 8 个工具（7 任务 + task_probe 诊断）；数据目录 ${dataDir({ profile: _profileHint })}`);
 
   // -------------------------------------------------------------------------
   // 启动自检：能力三态报告（对照《DSH 插件跨版本兼容层开发任务书》§5.2 / §9）。
@@ -2068,8 +2106,16 @@ export function apply(ctx, config) {
   let compatReport = null;
   try {
     // 探测单个能力：读属性本身也可能抛（受控代理），一项抛不该拖垮整份报告。
-    const has = (fn) => {
-      try { return fn() ? 'supported' : 'unsupported'; } catch { return 'unsupported'; }
+    // 但**不许把错误吞得无影无踪**（0.2.4）：以前 catch 里只返回 'unsupported'，
+    // 于是自检报「不支持」时，看不出是「服务真的没有」还是「查询本身抛了」。
+    // 现在把首个错误记下来，打进 compat 日志。
+    const capErrors = {};
+    const has = (fn, name) => {
+      try { return fn() ? 'supported' : 'unsupported'; }
+      catch (e) {
+        if (name) capErrors[name] = String(e?.message ?? e).slice(0, 120);
+        return 'unsupported';
+      }
     };
     const subCaps = probeSubagentCapabilities(ctx);
     // caps 的每一项都带 required 标记：
@@ -2089,9 +2135,9 @@ export function apply(ctx, config) {
       // 这三项必须走 ctx.get()：直取会在 cordis 4.x 抛 `without inject`，
       // has() 的 try/catch 会把错吞掉，于是自检恒报 unsupported——
       // 等于这行字本身就是那个 bug 的另一面（cwd 缺陷报告 §3.3）。
-      'sandbox.confine': { status: has(() => typeof ctx.get?.('sandbox')?.confine === 'function'), required: false },
-      'sandbox.policy': { status: has(() => typeof ctx.get?.('sandboxPolicy')?.resolve === 'function'), required: false },
-      'working_directory': { status: has(() => typeof ctx.get?.('workingDirectory')?.ensure === 'function'), required: true },
+      'sandbox.confine': { status: has(() => typeof ctx.get?.('sandbox')?.confine === 'function', 'sandbox.confine'), required: false },
+      'sandbox.policy': { status: has(() => typeof ctx.get?.('sandboxPolicy')?.resolve === 'function', 'sandbox.policy'), required: false },
+      'working_directory': { status: has(() => typeof ctx.get?.('workingDirectory')?.ensure === 'function', 'working_directory'), required: true },
       'system_prompt.section': { status: has(() => typeof ctx.systemPrompt?.section === 'function'), required: false },
     };
 
@@ -2125,6 +2171,8 @@ export function apply(ctx, config) {
       degraded,
       caps: Object.fromEntries(Object.entries(caps).map(([k, c]) => [k, c.status])),
       requiredFlags: Object.fromEntries(Object.entries(caps).filter(([, c]) => c.required).map(([k]) => [k, true])),
+      // 探测时抛过的错误（0.2.4）：报 unsupported 时得能分清「没有这个服务」和「查询本身失败」。
+      ...(Object.keys(capErrors).length ? { capErrors } : {}),
     };
     // 日志直接序列化对象本身，避免手写字段名和对象字段名对不上（overallStatus vs status）。
     log(`compat: ${JSON.stringify(compatReport)}`);
