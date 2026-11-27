@@ -212,7 +212,14 @@ function toTaskHandle(row) {
     nativeId: row.nativeId ?? null,
     nativeSessionId: row.nativeSessionId ?? null,
     stage: row.currentStage ?? null,
-    deadlineAt: row.deadlineAt ?? null,
+    // deadline 不落独立列，存在 labels JSON 里（见 task_create 的 insertTask）。
+    // 直接读 row.deadlineAt 恒为 undefined —— 0.1.6 那句「已过 deadline」的提示因此永不触发
+    // （2026-11-27 issue #1 A2）。这里从 labels 取，注意存的是字符串。
+    deadlineAt: (() => {
+      const raw = row.labels?.deadlineAt;
+      const n = Number(raw);
+      return Number.isFinite(n) && n > 0 ? n : null;
+    })(),
     createdAt: row.createdAt ?? null,
     updatedAt: row.updatedAt ?? null,
     resultSummary: row.resultSummary ?? null,
@@ -596,7 +603,8 @@ export function apply(ctx) {
       output: textOut(),
       async execute(args) {
         const d = db();
-        // 兜底探活：抽成 sweepOnce，task_list 与 task_describe 都调（2026-11-27 反馈 §3）。
+        // 兜底探活：**只有 task_list 会写台账**（2026-11-27 issue #1 A1 ——
+        // describe 曾也调它，但那是只读工具写终态，会把瞬时查不到的活任务打死）。
         const swept = sweepOnce(d);
         if (swept) log(`探活兜底：${swept} 条 subagent 任务原生已回收，补落 lost`);
         const all = d.listTasks({ limit: 500 }).sort((a, b) => b.createdAt - a.createdAt);
@@ -627,10 +635,13 @@ export function apply(ctx) {
       output: textOut(),
       async execute(args) {
         const d = db();
-        // 先扫一遍（与 task_list 同一套兜底）：查这一条之前，把整个台账里失联的补齐，
-        // 免得「describe 一条已回收的任务」只打一句查不到、状态纹丝不动（2026-11-27 反馈 §3）。
-        const swept = sweepOnce(d);
-        if (swept) log(`探活兜底（task_describe 触发）：补落 ${swept} 条 lost`);
+        // 只读工具不写台账（2026-11-27 issue #1 A1）。
+        //
+        // 0.1.6 这里调了 sweepOnce(d) —— 那是「扫全表 + 把查不到的补落 lost」的写操作。
+        // 问题：ctx.agents.get 可能瞬时查不到活着的 agent，而 lost 在 TERMINAL 里、
+        // 不可逆。一个只读的 describe 会因此把活着的任务打死。
+        // 改成：只对这一条做**只读**探活，查不到只在输出里提示，不动状态。
+        // 真正的状态清理留给 task_list（明确的「列一下」动作）与 subagent/end 结算。
         const tid = String(args?.taskId ?? '');
         const row = d.getTask(tid);
         if (!row) return { ok: false, text: `任务不存在：${args?.taskId}` };
@@ -640,14 +651,20 @@ export function apply(ctx) {
           `任务 ${t.id} 「${t.title}」 [${t.status}]`,
           `类型：${t.type}${t.nativeId ? `（native=${t.nativeId}）` : ''}`,
         ];
-        if (swept) lines.push(`（本轮探活补落 ${swept} 条 lost）`);
+        // 发起信息（0.1.6 之前是个永远不输出的死变量，issue #1 C1）
+        lines.push(`发起：${t.conversationId ?? '—'}  ${t.createdAt ? new Date(t.createdAt).toLocaleString() : '—'}`);
 
-        // subagent：真源在 DSH，台账只是投影 —— 这里每次现查一次原生 agent。
+        // subagent：真源在 DSH，台账只是投影 —— 这里现查一次原生 agent。
+        // 只读：查不到只提示，不改台账状态（改状态是 task_list / subagent/end 的事）。
         if (t.type === 'subagent' && (t.nativeSessionId || t.nativeId)) {
           try {
             const ag = getAgentHandle(ctx, t);
             if (!ag) {
               lines.push('原生 agent：查不到（可能已结束回收）');
+              if (ACTIVE.has(t.status)) {
+                lines.push('  ↳ 台账仍记 ' + t.status + '。要落终态请调 task_list（会做探活补落），'
+                  + '或 task_cancel 显式取消。describe 自己不写台账。');
+              }
             } else {
               const keys = Object.getOwnPropertyNames(ag).slice(0, 14).join(',');
               lines.push(`原生 agent：keys=${keys}`);
@@ -657,9 +674,6 @@ export function apply(ctx) {
             lines.push(`原生状态查询失败：${String(e).slice(0, 120)}`);
           }
         }
-        const _unused_orig = [
-          `发起：${t.conversationId}  ${new Date(t.createdAt).toLocaleString()}`,
-        ];
         if (t.stage && t.stage !== t.status) lines.push(`阶段：${t.stage}`);
         if (t.context) {
           const c = t.context;
@@ -735,10 +749,16 @@ export function apply(ctx) {
         //   0.2.2+ resolveName(caller, name) → SessionId
         //   0.2.1  listChildren(parentSessionId) → 按 label 匹配
         // 反查不出来就留 null（绝不把名字当 id 落库），并在返回文本里说清楚结算靠兜底。
+        //
+        // caller 兜底（2026-11-27 issue #1 A3）：exec.agent 在工具调用上下文里可能是空的，
+        // 而 listChildren 分支要 caller.session.id 当父会话 —— 空了就必然反查不到。
+        // 台账里记着 ownerSessionId，拿它造一个最小 caller 再试。
+        const caller = exec?.agent
+          ?? (row.ownerSessionId ? { session: { id: row.ownerSessionId }, id: row.ownerSessionId } : undefined);
         const realSid = await resolveSubagentSessionId(
           ctx,
           agentName,
-          exec?.agent,
+          caller,
           String(args?.sessionId ?? ''),
         );
         // queued → starting → running（V1.1 表 3：不再直达）
@@ -1034,7 +1054,7 @@ export function apply(ctx) {
     // ---------------------------------------------------------------------
     ctx.tools.register({
       name: 'task_probe',
-      description: '阶段 0 接口探测：列出 ctx 上与 jobs/agents/qq-native 相关的服务键与方法面。验收后保留为诊断工具。',
+      description: '阶段 0 接口探测：列出 ctx 上与 jobs/agents/tools/subagents 相关的服务键与方法面。验收后保留为诊断工具。',
       parameters: { type: 'object', additionalProperties: false, properties: {} },
       output: textOut(),
       async execute() {
@@ -1308,6 +1328,30 @@ export function apply(ctx) {
             ctx.jobs.kill(t.nativeId, t.ownerSessionId ?? undefined, 'deadline 超时，协调器请求取消');
           }
         } catch { /* 原生已死也无妨，结算/对账会收 */ }
+
+        // subagent 没有可调的 kill：请求取消之后要等 subagent/end，
+        // 而那个 agent 可能早就没了 —— 那样会永远卡在 cancel_requested（issue #1 A4）。
+        // 所以这里对 subagent 追一次探活：原生已不在就直接落 lost，别等一个不会来的事件。
+        if (t.type === 'subagent' && t.nativeSessionId) {
+          let gone = false;
+          try {
+            gone = !getAgentHandle(ctx, t);
+          } catch { gone = false; /* 探不动就别下结论 */ }
+          if (gone) {
+            d.updateTaskFields(t.id, {
+              status: 'lost',
+              currentStage: 'deadline-exceeded',
+              errorSummary: `已超 deadline（${LIMITS_READ().timeoutMinutes} 分钟），且原生 subagent 已不在`,
+              updatedAt: Date.now(),
+              completedAt: Date.now(),
+            });
+            emitEvent(null, t.id, 'task.lost', 'coordinator', 'deadline 超时 + 原生已回收');
+            settleNotification(null, { id: t.id, status: 'lost' });
+            changed += 1;
+            continue;
+          }
+        }
+
         if (t.status !== 'cancel_requested') {
           d.updateTaskFields(t.id, {
             status: 'cancel_requested',
