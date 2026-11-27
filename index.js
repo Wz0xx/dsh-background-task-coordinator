@@ -22,6 +22,11 @@ import {
   probeSubagentCapabilities,
   getAgentHandle,
 } from './compat/subagents-adapter.js';
+import {
+  archiveSession,
+  unarchiveSession,
+  probeArchiveCapability,
+} from './compat/session-archive.js';
 
 export const inject = ['tools', 'jobs', 'agents', 'systemPrompt'];
 /**
@@ -277,8 +282,26 @@ function settleNotification(_dbRef, t) {
 }
 
 // ---------------------------------------------------------------------------
-// ctx.jobs 探测（V3：服务键名与 start 语义实测）
+// 归档策略（子智能体用完之后自动收拾）
 // ---------------------------------------------------------------------------
+// 为什么要有这个：面板上的「子智能体」列表是父会话日志里 subagent/catalog 的投影，
+// 面板没有删除入口；跑完的子会话会一直挂在那儿。DSH 自己给的正路是
+// workspaceController.archiveSession（契约见 compat/session-archive.js）。
+//
+// 默认开，但只归档 subagent 任务的子会话，且只在落终态之后。关法：
+//   cordis.patch.yml 里 config: { autoArchiveSubagents: false }
+const ARCHIVE_DEFAULTS = {
+  autoArchiveSubagents: true,   // 子会话跑完自动归档
+  archiveStopActivity: false,   // 归档时不必再停一次（任务已终态）
+};
+
+function readArchiveConfig(config) {
+  const c = config && typeof config === 'object' ? config : {};
+  return {
+    autoArchiveSubagents: c.autoArchiveSubagents !== false,
+    archiveStopActivity: c.archiveStopActivity === true,
+  };
+}
 
 function probeJobs(ctx, injected) {
   const candidates = ['jobs', 'jobRegistry', 'backgroundJobs'];
@@ -299,13 +322,14 @@ function probeJobs(ctx, injected) {
 // 插件主体
 // ---------------------------------------------------------------------------
 
-export function apply(ctx) {
+export function apply(ctx, config) {
   const logger = typeof ctx.logger?.info === 'function' ? ctx.logger : null;
   const log = (msg) => logger?.info?.(`[task-coordinator] ${msg}`);
   _log = log; // 模块级函数（migrate 等）也要能打日志
 
   const INJECTED = new Set(inject);
   const jobsProbe = probeJobs(ctx, INJECTED);
+  const archiveCfg = readArchiveConfig(config);
 
   // ---------------------------------------------------------------------
   // 系统提示：教模型什么时候用这些工具（任务书阶段 2 的后半）
@@ -339,6 +363,42 @@ export function apply(ctx) {
       + '没有它 task_create 只能建 subagent，建 job 会报 "no job controller serves this agent"。');
   }
 
+
+  // -------------------------------------------------------------------------
+  // 子会话归档：任务落终态后，把它的子会话从面板「子智能体」列表里收走。
+  // 面板那个列表是父会话日志里 subagent/catalog 的投影，本身没有删除入口；
+  // DSH 给的正路是 workspaceController.archiveSession（见 compat/session-archive.js）。
+  // 边界：只动 subagent 类型、只在终态、没解析出会话 id 的不动、每任务最多试一次。
+  // -------------------------------------------------------------------------
+  const archiveTried = new Set();
+
+  async function archiveTaskSession(t, opts = {}) {
+    const force = opts.force === true;               // 手动归档时忽略「只试一次」
+    if (!archiveCfg.autoArchiveSubagents && !force) return { ok: false, reason: '自动归档已关闭' };
+    if (!t || t.type !== 'subagent') return { ok: false, reason: '不是 subagent 任务' };
+    if (!TERMINAL.has(t.status)) return { ok: false, reason: `任务未终态（${t.status}），不归档活动任务` };
+    const target = t.nativeSessionId || null;
+    if (!target) return { ok: false, reason: '没有会话 id（登记时未解析出来），无从归档' };
+    if (!force && archiveTried.has(t.id)) return { ok: false, reason: '本进程内已尝试过' };
+    archiveTried.add(t.id);
+
+    const res = await archiveSession(ctx, target, { stopActivity: archiveCfg.archiveStopActivity });
+    if (res.ok) {
+      emitEvent(null, t.id, 'task.archived', 'coordinator', `子会话 ${target} 已归档`);
+      try {
+        const cur = db().getTask(t.id);
+        db().updateTaskFields(t.id, {
+          labels: { ...(cur?.labels ?? t.labels ?? {}), archivedSessionId: target },
+          updatedAt: Date.now(),
+        });
+      } catch { /* 台账写失败不影响归档事实 */ }
+      log(`归档：${t.id} 的子会话 ${target}`);
+      return { ok: true, sessionId: target };
+    }
+    emitEvent(null, t.id, 'task.archive_failed', 'coordinator', res.reason ?? '未知原因');
+    log(`归档失败（不阻塞）：${t.id} → ${res.reason ?? '未知原因'}`);
+    return { ok: false, reason: res.reason ?? '未知原因' };
+  }
 
   const disposers = [
     // ---------------------------------------------------------------------
@@ -566,6 +626,7 @@ export function apply(ctx) {
           });
           emitEvent(null, t.id, 'task.lost', 'reconciler', '探活兜底');
           settleNotification(null, { id: t.id, status: 'lost' });
+          void archiveTaskSession({ ...t, status: 'lost' });
           swept += 1;
         }
         if (swept) log(`探活兜底：${swept} 条 subagent 任务原生已回收，补落 lost`);
@@ -923,6 +984,7 @@ export function apply(ctx) {
           emitEvent(null, tid, 'task.cancelled', 'user', reason);
           settleNotification(null, { id: tid, status: 'cancelled' });
           t.status = 'cancelled';
+          void archiveTaskSession({ ...row, status: 'cancelled' });
         } else {
           d.updateTaskFields(tid, { status: 'cancel_requested', currentStage: 'cancelling', errorSummary: reason, updatedAt: Date.now() });
           emitEvent(null, tid, 'task.cancel_requested', 'user', `${reason}（native: ${nativeOk ?? '未绑定执行单元'}）`);
@@ -1013,6 +1075,78 @@ export function apply(ctx) {
     }),
 
     // ---------------------------------------------------------------------
+    // task_archive —— 手动归档/恢复子会话（自动归档的补手）
+    //   面板上那个「子智能体」列表是父会话日志的投影，清不掉；这里走
+    //   workspaceController.archiveSession 把子会话从列表里收走。
+    //   action=archive 归档 / action=unarchive 恢复。
+    // ---------------------------------------------------------------------
+    ctx.tools.register({
+      name: 'task_archive',
+      description: '归档或恢复子会话（把跑完的子智能体从面板列表里收走）。action=archive 归档，action=unarchive 恢复。不传 taskId 时归档所有已终态且未归档的 subagent 任务。',
+      parameters: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          action: { type: 'string', enum: ['archive', 'unarchive'], description: '归档或恢复' },
+          taskId: { type: 'string', description: '指定任务；不传则批量处理已终态未归档的 subagent 任务' },
+        },
+      },
+      output: textOut(),
+      async execute(args) {
+        const action = args?.action === 'unarchive' ? 'unarchive' : 'archive';
+        const d = db();
+        const capOk = probeArchiveCapability(ctx) === 'supported';
+        if (!capOk) {
+          return { ok: false, text: '这台宿主没有 workspaceController.archiveSession，本版本不支持归档（面板列表清不掉）。' };
+        }
+
+        // 恢复：必须给 taskId 或 sessionId，不做批量恢复（避免误恢复）
+        if (action === 'unarchive') {
+          const tid = String(args?.taskId ?? '');
+          if (!tid) return { ok: false, text: '恢复需要指定 taskId（不做批量恢复，避免误恢复）。' };
+          const row = d.getTask(tid);
+          if (!row) return { ok: false, text: `任务不存在：${tid}` };
+          const sid = row.labels?.archivedSessionId || row.nativeSessionId;
+          if (!sid) return { ok: false, text: `任务 ${tid} 没有可恢复的会话 id（从未归档或没解析出 id）。` };
+          const res = await unarchiveSession(ctx, sid);
+          if (res.ok) {
+            emitEvent(null, tid, 'task.unarchived', 'user', `子会话 ${sid} 已恢复`);
+            return { ok: true, text: `已恢复 task ${tid} 的子会话 ${sid}。` };
+          }
+          return { ok: false, text: `恢复失败：${res.reason ?? '未知原因'}` };
+        }
+
+        // 归档：单个或批量
+        const only = String(args?.taskId ?? '');
+        const targets = only
+          ? [d.getTask(only)].filter(Boolean)
+          : d.listTasks({ limit: 500 }).filter(
+              (x) => x.type === 'subagent' && TERMINAL.has(x.status) && x.nativeSessionId
+                && !x.labels?.archivedSessionId,
+            );
+        if (!targets.length) {
+          return { ok: true, text: only ? '任务不存在或不是 subagent。' : '没有需要归档的已终态 subagent 任务。' };
+        }
+
+        const lines = [];
+        let done = 0;
+        for (const t of targets) {
+          const res = await archiveTaskSession(t, { force: true });
+          if (res.ok) {
+            lines.push(`✅ ${t.id} 「${t.title}」 → 会话 ${res.sessionId}`);
+            done += 1;
+          } else {
+            lines.push(`⚠️ ${t.id} 「${t.title}」 → ${res.reason}`);
+          }
+        }
+        return {
+          ok: done > 0,
+          text: [`归档完成 ${done}/${targets.length}`, ...lines].join('\n'),
+        };
+      },
+    }),
+
+    // ---------------------------------------------------------------------
     // task_probe —— 阶段 0 探测器（V3/V6 的实测入口，验收后保留为诊断工具）
     // ---------------------------------------------------------------------
     ctx.tools.register({
@@ -1072,6 +1206,7 @@ export function apply(ctx) {
       'sandbox.policy': typeof ctx.sandboxPolicy?.resolve === 'function' ? 'supported' : 'unsupported',
       'working_directory': typeof ctx.workingDirectory?.ensure === 'function' ? 'supported' : 'unsupported',
       'system_prompt.section': typeof ctx.systemPrompt?.section === 'function' ? 'supported' : 'unsupported',
+      'session.archive': probeArchiveCapability(ctx),
     };
     // 必需能力：缺哪个插件就得降级/不可用（任务书 §9 判定）
     const required = ['job.start', 'job.inspect', 'job.cancel', 'agent.get'];
@@ -1131,6 +1266,7 @@ export function apply(ctx) {
         });
         emitEvent(null, t.id, 'task.lost', 'coordinator', '重启后原生执行单元已不存在（台账投影修正，非真实失败）');
         settleNotification(null, { id: t.id, status: 'lost' });
+        void archiveTaskSession({ ...t, status: 'lost' });
         fixed += 1;
       }
     }
@@ -1185,6 +1321,8 @@ export function apply(ctx) {
       emitEvent(null, t.id, failed ? 'task.failed' : cancelled ? 'task.cancelled' : 'task.succeeded', 'executor', raw.slice(0, 200));
       settleNotification(null, { id: t.id, status });
       log(`结算：${t.id} → ${status}（subagent/end）`);
+      // 落终态之后收拾子会话（不 await：归档慢不该拖住事件回调）
+      void archiveTaskSession({ ...t, status });
     });
     if (typeof offEnd === 'function') disposers.push(offEnd);
     log('已订阅 subagent/end');

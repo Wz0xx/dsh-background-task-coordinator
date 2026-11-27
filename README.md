@@ -131,7 +131,21 @@ background jobs unavailable: no job controller serves this agent
 | `task_append_message` | 追加指令（`next-turn` / `next-step`） |
 | `task_cancel` | 取消 |
 | `task_context` | 任务级共享上下文：阶段、决策、改动过的文件、待办 |
+| `task_archive` | 归档/恢复子会话（把跑完的子智能体从面板列表里收走） |
 | `task_probe` | 诊断：列出宿主 jobs/agents 服务的方法面，排查环境用 |
+
+### 子智能体自动归档
+
+面板上那个「子智能体」列表是父会话日志里 `subagent/catalog` 事件的投影，**面板自己没有任何删除入口**——子代理跑完就一直在那儿挂着。
+
+插件补上了这一步：subagent 任务落终态（`succeeded` / `failed` / `cancelled` / `lost`）时，自动调 DSH 的 `workspaceController.archiveSession` 把它的子会话收走。
+
+- **默认开**。关法：`cordis.patch.yml` 里 `config: { autoArchiveSubagents: false }`
+- **只归档 subagent 类型**，不碰你自己的普通会话
+- **只在终态之后**动手，活动中的绝不归档
+- **没解析出会话 id 的不归档**（不瞎猜）
+- 归档失败记 `task.archive_failed` 事件，不假装成功
+- 手动补手：`task_archive {action:"archive"}` 批量归档已终态的；`{action:"unarchive", taskId}` 恢复
 
 ### 一条重要约定
 
