@@ -189,26 +189,45 @@ function migrateJsonFileIfNeeded() {
 // saveTasks 变成 no-op（SQLite 同步落库，无需显式保存）。
 // 「读-改-写」的工具路径改用下面的 withTask 原子操作。
 
+/**
+ * 台账行 → 工具内部用的任务对象（唯一入口）。
+ *
+ * 为什么必须走这个函数：getAgentHandle 靠 nativeSessionId 找 agent，
+ * 少这个字段就会退回用 agent 名字查 ctx.agents（该表只按 session id 索引）→ 恒 undefined。
+ * 0.1.5 就是三处工具各手抄了一遍字段，describe 与 append 两处漏了 nativeSessionId，
+ * 于是「改成 getAgentHandle」等于空转（2026-11-27 反馈 §1）。
+ *
+ * 新增工具一律调它，不要再手拼。
+ */
+function toTaskHandle(row) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    conversationId: row.conversationId ?? null,
+    type: row.type === 'subagent' ? 'subagent' : 'job',
+    title: row.title ?? null,
+    objective: row.objective ?? null,
+    status: row.status ?? null,
+    // 两者都要：nativeId 是 agent 名（登记时人给的那半），nativeSessionId 是反查出来的真会话 id。
+    nativeId: row.nativeId ?? null,
+    nativeSessionId: row.nativeSessionId ?? null,
+    stage: row.currentStage ?? null,
+    deadlineAt: row.deadlineAt ?? null,
+    createdAt: row.createdAt ?? null,
+    updatedAt: row.updatedAt ?? null,
+    resultSummary: row.resultSummary ?? null,
+    errorSummary: row.errorSummary ?? null,
+    labels: row.labels ?? null,
+  };
+}
+
 function loadTasks() {
   const d = db();
   const tasks = {};
   for (const t of d.listTasks({ limit: 500 })) {
     tasks[t.id] = {
-      id: t.id,
-      conversationId: t.conversationId,
-      type: t.type === 'subagent' ? 'subagent' : 'job',
-      title: t.title,
-      objective: t.objective,
-      status: t.status,
-      nativeId: t.nativeId ?? null,
-      nativeSessionId: t.nativeSessionId ?? null,
-      stage: t.currentStage ?? null,
+      ...toTaskHandle(t),
       version: 1,
-      deadlineAt: null,
-      createdAt: t.createdAt,
-      updatedAt: t.updatedAt,
-      resultSummary: t.resultSummary ?? null,
-      errorSummary: t.errorSummary ?? null,
       context: null, // 上下文经 db().getContext 读（工具路径单独处理）
       messages: [],
     };
@@ -339,6 +358,34 @@ export function apply(ctx) {
       + '没有它 task_create 只能建 subagent，建 job 会报 "no job controller serves this agent"。');
   }
 
+
+  /**
+   * 兜底探活（一次扫描）：把「原生已回收但没收到 subagent/end」的活动 subagent 任务补落 lost。
+   *
+   * 只对带 nativeSessionId 的行动手（有 id 才探得动）；解析不出 id 的一律不动 ——
+   * 那是「不知道」，不是「死了」。返回本轮补落的条数。
+   *
+   * task_list 与 task_describe 都调它（2026-11-27 反馈 §3：
+   * 文档写了两处都触发，代码原来只有 task_list，两头不靠）。
+   */
+  function sweepOnce(d) {
+    let swept = 0;
+    for (const t of d.listTasks({ limit: 500 })) {
+      if (t.type !== 'subagent' || !ACTIVE.has(t.status) || !t.nativeSessionId) continue;
+      if (getAgentHandle(ctx, t)) continue;
+      d.updateTaskFields(t.id, {
+        status: 'lost',
+        currentStage: 'reconciled',
+        errorSummary: '探活兜底：原生 subagent 已回收，但没收到 subagent/end',
+        updatedAt: Date.now(),
+        completedAt: Date.now(),
+      });
+      emitEvent(null, t.id, 'task.lost', 'reconciler', '探活兜底');
+      settleNotification(null, { id: t.id, status: 'lost' });
+      swept += 1;
+    }
+    return swept;
+  }
 
   const disposers = [
     // ---------------------------------------------------------------------
@@ -549,25 +596,8 @@ export function apply(ctx) {
       output: textOut(),
       async execute(args) {
         const d = db();
-        // 兜底探活（2026-11-27 反馈 #2 的 P1 项）：subagent/end 事件可能因为
-        // 名字->id 没解析出来而认不出任务。这里在列任务时顺手扫一遍活动中的 subagent：
-        // 只对「已经有 nativeSessionId」的行动手（有 id 才能探活），
-        // 查不到 agent = 原生已回收但没收到事件 → 补落 lost。解析不出 id 的一律不动。
-        let swept = 0;
-        for (const t of d.listTasks({ limit: 500 })) {
-          if (t.type !== 'subagent' || !ACTIVE.has(t.status) || !t.nativeSessionId) continue;
-          if (getAgentHandle(ctx, t)) continue;
-          d.updateTaskFields(t.id, {
-            status: 'lost',
-            currentStage: 'reconciled',
-            errorSummary: '探活兜底：原生 subagent 已回收，但没收到 subagent/end',
-            updatedAt: Date.now(),
-            completedAt: Date.now(),
-          });
-          emitEvent(null, t.id, 'task.lost', 'reconciler', '探活兜底');
-          settleNotification(null, { id: t.id, status: 'lost' });
-          swept += 1;
-        }
+        // 兜底探活：抽成 sweepOnce，task_list 与 task_describe 都调（2026-11-27 反馈 §3）。
+        const swept = sweepOnce(d);
         if (swept) log(`探活兜底：${swept} 条 subagent 任务原生已回收，补落 lost`);
         const all = d.listTasks({ limit: 500 }).sort((a, b) => b.createdAt - a.createdAt);
         const wantAll = Boolean(args?.all);
@@ -597,28 +627,20 @@ export function apply(ctx) {
       output: textOut(),
       async execute(args) {
         const d = db();
+        // 先扫一遍（与 task_list 同一套兜底）：查这一条之前，把整个台账里失联的补齐，
+        // 免得「describe 一条已回收的任务」只打一句查不到、状态纹丝不动（2026-11-27 反馈 §3）。
+        const swept = sweepOnce(d);
+        if (swept) log(`探活兜底（task_describe 触发）：补落 ${swept} 条 lost`);
         const tid = String(args?.taskId ?? '');
         const row = d.getTask(tid);
         if (!row) return { ok: false, text: `任务不存在：${args?.taskId}` };
-        const t = {
-          id: row.id,
-          conversationId: row.conversationId,
-          type: row.type === 'subagent' ? 'subagent' : 'job',
-          title: row.title,
-          objective: row.objective,
-          status: row.status,
-          nativeId: row.nativeId ?? null,
-          stage: row.currentStage ?? null,
-          deadlineAt: null,
-          createdAt: row.createdAt,
-          resultSummary: row.resultSummary ?? null,
-          errorSummary: row.errorSummary ?? null,
-          context: d.getContext(tid) ?? null,
-        };
+        const t = toTaskHandle(row);
+        t.context = d.getContext(tid) ?? null;
         const lines = [
           `任务 ${t.id} 「${t.title}」 [${t.status}]`,
           `类型：${t.type}${t.nativeId ? `（native=${t.nativeId}）` : ''}`,
         ];
+        if (swept) lines.push(`（本轮探活补落 ${swept} 条 lost）`);
 
         // subagent：真源在 DSH，台账只是投影 —— 这里每次现查一次原生 agent。
         if (t.type === 'subagent' && (t.nativeSessionId || t.nativeId)) {
@@ -769,11 +791,7 @@ export function apply(ctx) {
         const mode = args?.mode === 'next-step' ? 'next-step' : 'next-turn';
         const idem = String(args?.idempotencyKey ?? '').slice(0, 128);
         const mid = `msg-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
-        const t = {
-          id: row.id,
-          type: row.type === 'subagent' ? 'subagent' : 'job',
-          nativeId: row.nativeId ?? null,
-        };
+        const t = toTaskHandle(row);
 
         // 幂等键去重（任务书表 7 / 11.1）：显式键或自动键（内容哈希）命中即不再投。
         const autoKey = `msg:${tid}:user:${fnv1a(content)}`;
@@ -855,7 +873,8 @@ export function apply(ctx) {
             deliveredAt: Date.now(),
           });
           emitEvent(null, tid, 'task.message_appended', 'model', `delivered(${mode}): ${content.slice(0, 80)}`);
-          return { ok: true, text: `已投递到 agent ${t.nativeId}（${mid}，mode=${mode}）。busy 时进收件箱，下一可接收时机处理，不打断当前工具调用。` };
+          const sid = t.nativeSessionId || t.nativeId;
+          return { ok: true, text: `已投递到 agent ${t.nativeId}${t.nativeSessionId ? `（会话 ${sid}）` : ''}（${mid}，mode=${mode}）。busy 时进收件箱，下一可接收时机处理，不打断当前工具调用。` };
         } catch (e) {
           d.insertMessage({
             messageId: mid,
@@ -898,9 +917,7 @@ export function apply(ctx) {
         if (row.status === 'cancel_requested') {
           return { ok: true, text: `取消已请求过（task ${tid}），等执行器确认，别重复发。` };
         }
-        const t = {
-          id: row.id, type: row.type === 'subagent' ? 'subagent' : 'job', nativeId: row.nativeId ?? null,
-        };
+        const t = toTaskHandle(row);
         const reason = String(args?.reason ?? '用户取消').slice(0, 200);
         let nativeOk = null;
         try {
@@ -1058,39 +1075,69 @@ export function apply(ctx) {
   // -------------------------------------------------------------------------
   let compatReport = null;
   try {
-    const subCaps = probeSubagentCapabilities(ctx);
-    const caps = {
-      'job.start': typeof ctx.jobs?.start === 'function' ? 'supported' : 'unsupported',
-      'job.inspect': typeof ctx.jobs?.get === 'function' && typeof ctx.jobs?.readAt === 'function' ? 'supported' : 'unsupported',
-      'job.cancel': typeof ctx.jobs?.kill === 'function' ? 'supported' : 'unsupported',
-      'job.settle_event': typeof ctx.jobs?.events?.subscribe === 'function' ? 'supported' : 'unsupported',
-      'job.activity_event': typeof ctx.on === 'function' ? 'supported' : 'unsupported',
-      'agent.get': typeof ctx.agents?.get === 'function' ? 'supported' : 'unsupported',
-      'subagent.resolve_name': subCaps.resolveName,
-      'subagent.list_children': subCaps.listChildren,
-      'sandbox.confine': typeof ctx.sandbox?.confine === 'function' ? 'supported' : 'unsupported',
-      'sandbox.policy': typeof ctx.sandboxPolicy?.resolve === 'function' ? 'supported' : 'unsupported',
-      'working_directory': typeof ctx.workingDirectory?.ensure === 'function' ? 'supported' : 'unsupported',
-      'system_prompt.section': typeof ctx.systemPrompt?.section === 'function' ? 'supported' : 'unsupported',
+    // 探测单个能力：读属性本身也可能抛（受控代理），一项抛不该拖垮整份报告。
+    const has = (fn) => {
+      try { return fn() ? 'supported' : 'unsupported'; } catch { return 'unsupported'; }
     };
-    // 必需能力：缺哪个插件就得降级/不可用（任务书 §9 判定）
-    const required = ['job.start', 'job.inspect', 'job.cancel', 'agent.get'];
-    const missingRequired = required.filter((k) => caps[k] !== 'supported');
-    // subagent 结算至少要有一条反查路，否则 subagent 任务无法自动落账
-    const settlePath = (caps['subagent.resolve_name'] === 'supported' || caps['subagent.list_children'] === 'supported')
-      ? 'supported' : 'unsupported';
-    caps['subagent.settle_resolve'] = settlePath;
-    const degraded = Object.entries(caps).filter(([, v]) => v !== 'supported').map(([k]) => k);
+    const subCaps = probeSubagentCapabilities(ctx);
+    // caps 的每一项都带 required 标记：
+    //   required = 缺了插件核心功能就不能用（→ overallStatus 判 incompatible）
+    //   optional = 缺了只是少一条路（→ 记进 degraded，但不影响 overallStatus）
+    // 0.1.5 的错误是把「任何一项 unsupported」都算 degraded，导致 0.2.2 上恒 degraded
+    // ——一个永远亮的告警等于没有告警（2026-11-27 反馈 §2）。
+    const caps = {
+      'job.start': { status: has(() => typeof ctx.jobs?.start === 'function'), required: true },
+      'job.inspect': { status: has(() => typeof ctx.jobs?.get === 'function' && typeof ctx.jobs?.readAt === 'function'), required: true },
+      'job.cancel': { status: has(() => typeof ctx.jobs?.kill === 'function'), required: true },
+      'job.settle_event': { status: has(() => typeof ctx.jobs?.events?.subscribe === 'function'), required: false },
+      'job.activity_event': { status: has(() => typeof ctx.on === 'function'), required: false },
+      'agent.get': { status: has(() => typeof ctx.agents?.get === 'function'), required: true },
+      'subagent.resolve_name': { status: subCaps.resolveName, required: false },
+      'subagent.list_children': { status: subCaps.listChildren, required: false },
+      'sandbox.confine': { status: has(() => typeof ctx.sandbox?.confine === 'function'), required: false },
+      'sandbox.policy': { status: has(() => typeof ctx.sandboxPolicy?.resolve === 'function'), required: false },
+      'working_directory': { status: has(() => typeof ctx.workingDirectory?.ensure === 'function'), required: false },
+      'system_prompt.section': { status: has(() => typeof ctx.systemPrompt?.section === 'function'), required: false },
+    };
+
+    // 组合能力：subagent 结算只要有**任意一条**反查路即可（resolve_name 或 list_children，OR 关系）。
+    // 单独看 list_children 是 unsupported 不代表降级 —— 它只是 0.2.1 的降级路径。
+    const canResolveByOurselves = caps['subagent.resolve_name'].status === 'supported'
+      || caps['subagent.list_children'].status === 'supported';
+    caps['subagent.settle_resolve'] = {
+      status: canResolveByOurselves ? 'supported' : 'unsupported',
+      required: false,
+    };
+
+    const missingRequired = Object.entries(caps)
+      .filter(([, c]) => c.required && c.status !== 'supported')
+      .map(([k]) => k);
+    // degraded 只算「非必需且确实缺」的。
+    // 但 resolve_name / list_children 是 OR 关系的一对手段：只要有一条能用就不算降级，
+    // 单独把另一条报成 degraded 就是误报（0.2.2 上必然如此 → 恒 degraded → 告警失效）。
+    const orGroup = new Set(['subagent.resolve_name', 'subagent.list_children', 'subagent.settle_resolve']);
+    const degraded = Object.entries(caps)
+      .filter(([k, c]) => {
+        if (c.required || c.status === 'supported') return false;
+        if (orGroup.has(k)) return !canResolveByOurselves; // 整组一起判，不单独报
+        return true;
+      })
+      .map(([k]) => k);
+
     compatReport = {
       overallStatus: missingRequired.length ? 'incompatible' : degraded.length ? 'degraded' : 'compatible',
       missingRequired,
       degraded,
-      caps,
+      caps: Object.fromEntries(Object.entries(caps).map(([k, c]) => [k, c.status])),
+      requiredFlags: Object.fromEntries(Object.entries(caps).filter(([, c]) => c.required).map(([k]) => [k, true])),
     };
     // 日志直接序列化对象本身，避免手写字段名和对象字段名对不上（overallStatus vs status）。
     log(`compat: ${JSON.stringify(compatReport)}`);
     if (missingRequired.length) {
-      log(`compat 警告：必需能力缺失（${missingRequired.join('、')}），job 类型的任务将无法创建；subagent 类型仍可用。`);
+      log(`compat 警告：必需能力缺失（${missingRequired.join('、')}），相关任务类型将无法使用。`);
+    }
+    if (!canResolveByOurselves) {
+      log('compat 提示：resolve_name 与 list_children 都不可用，subagent 结算只能靠 task_list 探活兜底。');
     }
   } catch (e) {
     log(`compat 检测失败（不阻塞）：${String(e).slice(0, 160)}`);
