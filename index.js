@@ -130,12 +130,20 @@ function makeChunkDecoder() {
     const b = Buffer.isBuffer(buf) ? buf : Buffer.from(buf);
     if (dec) return dec.decode(b, { stream: true });
 
-    // 未判定：先看这段里有没有非 ASCII 字节。
-    // 纯 ASCII 段在多字节编码里必然自成整字（UTF-8 前导字节 ≥0xC0，GBK 前导 ≥0x81），
-    // 所以可以直接吐出去，不必进缓冲，也不会劈开后面的字符。
-    let hasHigh = false;
-    for (const byte of b) { if (byte >= 0x80) { hasHigh = true; break; } }
-    if (!hasHigh) return b.toString('utf8');
+    // 未判定且**当前没有积压字节**时，纯 ASCII 段可直接吐出而不锁定编码。
+    //
+    // 为什么必须加 `pendingLen === 0`（0.2.3，Gemini 补丁采纳）：
+    // 有积压时旁路会犯两个错 ——
+    //   ① 乱序：积压的字节该先吐，ASCII 段抢在前面出去了；
+    //   ② 拆字：GBK 次字节可以落在 ASCII 区（0x40–0x7E），
+    //      比如「丂」= 81 40 跨两个 chunk，前一个 chunk 是 81（进 pending），
+    //      后一个 chunk 是 40（纯 ASCII？不，40 低于 0x80 所以被当成纯 ASCII 直接吐）
+    //      → 一个字被劈成两半，前面是个悬挂的前导字节。
+    if (pendingLen === 0) {
+      let hasHigh = false;
+      for (const byte of b) { if (byte >= 0x80) { hasHigh = true; break; } }
+      if (!hasHigh) return b.toString('utf8');
+    }
 
     pending.push(b);
     pendingLen += b.length;
@@ -153,7 +161,18 @@ function makeChunkDecoder() {
       return tail || '';
     }
     const rest = takeAll();
-    return rest.length ? rest.toString('utf8') : '';
+    if (!rest.length) return '';
+    // 流结束时若 pending 只剩 1~3 字节的短 GBK（比如 "A中" = 41 D6 D0），
+    // sniff 因「尾部截断保护」返回过 null，走到这里已无后续字节可等。
+    // 直接 toString('utf8') 会吐乱码（0.2.2 及以前的 bug，0.2.3 修）——
+    // 必须严格试一次：过了就是 utf8，过不了就是 gbk。
+    try {
+      enc = 'utf8';
+      return new TextDecoder('utf-8', { fatal: true }).decode(rest);
+    } catch {
+      enc = 'gbk';
+      return new TextDecoder('gbk').decode(rest);
+    }
   };
   decoder.encoding = () => enc;
   return decoder;
@@ -598,13 +617,19 @@ export function apply(ctx, config) {
   };
   const clearMiss = (id) => { if (missStreak.has(id)) missStreak.delete(id); };
 
-  function sweepOnce(d) {
+  function sweepOnce(d, caller = null) {
     let swept = 0;
+    let suspects = 0;
     const now = Date.now();
     // 只扫活动 subagent（走 idx_tasks_status_created），不再拉全表前 500 条
     // —— 任务累积到 500 条以上时，活动任务会掉出窗口，永远扫不到（审计 P1-4）。
     for (const t of d.listActive([...ACTIVE])) {
       if (t.type !== 'subagent' || !ACTIVE.has(t.status)) continue;
+      // 归属隔离（0.2.3，Gemini 补丁采纳；对应我 0.2.1 文档里记的那条残留）：
+      // 有明确 caller 时只探活**自己的**任务。以前 task_list 会跨所有会话扫并写终态，
+      // 等于 A 会话调一下 task_list 就可能把 B 会话的任务标成 lost —— 写别人台账。
+      // 拿不到 caller（历史/无 exec 的宿主）时才退回全扫，保持兼容。
+      if (caller && t.ownerSessionId && String(t.ownerSessionId) !== String(caller)) continue;
 
       // 有 session id：按 id 探活。
       // 没 session id：这个 agent 从来没被接上过，探不了。但不能就这么放过 ——
@@ -632,6 +657,7 @@ export function apply(ctx, config) {
         const n = bumpMiss(t.id, now);
         if (n < MISS_THRESHOLD) {
           log(`探活 miss ${n}/${MISS_THRESHOLD}：${t.id}，本轮先不动`);
+          suspects += 1;   // 告诉调用方「有条在怀疑中，再查一次才落终态」
           continue;
         }
         gone = true;
@@ -663,7 +689,9 @@ export function apply(ctx, config) {
     for (const id of missStreak.keys()) {
       if (!liveIds.has(id)) missStreak.delete(id);
     }
-    return swept;
+    // 返回对象而不是数字（0.2.3）：suspects 让 task_list 能告诉用户
+    // 「有条第一次没命中、再查一次才落 lost」——不然两条上限像一个不透明的延迟。
+    return { swept, suspects };
   }
 
   /**
@@ -937,6 +965,9 @@ export function apply(ctx, config) {
           // 是否让 Node 跳过参数引号转义。只有「我们自己拼的 cmd /d /s /c」那条分支该开；
           // 沙箱包装器给的 argv 绝不能开（见两处赋值处的注释）。
           let verbatim = false;
+          // 沙箱要求的环境变量（sandbox.confine 的 env，可选）。
+          // 0.2.3 起透传：只吃 argv 不吃 env 是半套隔离。
+          let sandboxedEnv = null;
           try {
             // agent 兜底与 cwd 段一致：exec.agent 常为空，退到台账 ownerSessionId 捞。
             const ag = exec?.agent
@@ -980,6 +1011,15 @@ export function apply(ctx, config) {
               // 沙箱包装器的 argv 里常见 `C:\Program Files\...` 这种带空格的绝对路径，
               // 它**必须**走 Node 的正常引号转义，否则会被劈成多个参数（0.2.1 修）。
               verbatim = false;
+              // 透传沙箱要求的环境变量（0.2.3，Gemini 补丁采纳）。
+              // sandbox.confine() 的契约里可以带 env —— 那通常是沙箱自己设的隔离变量
+              // （HOME/TMPDIR/PATH 重定向之类的）。只吃 argv 不吃 env 等于半套隔离：
+              // 命令在沙箱里跑，但环境看着还是宿主那一套。
+              // 注意合并方向：宿主环境作底、沙箱覆盖在上 —— 沙箱说的算。
+              if (sandboxed.env && typeof sandboxed.env === 'object') {
+                sandboxedEnv = sandboxed.env;
+                log(`沙箱 env 透传 ${Object.keys(sandboxedEnv).length} 项`);
+              }
             }
           } catch (e) {
             // 区分两类错误（2026-11-27 下游补丁反馈 §3）：
@@ -1018,6 +1058,9 @@ export function apply(ctx, config) {
                   // sandbox.confine 返回的 argv 里常有 `C:\Program Files\...` 这类带空格路径，
                   // 跳过转义会把它们劈成多个错误参数。所以按 argv 的来源决定，不无条件开。
                   windowsVerbatimArguments: process.platform === 'win32' && verbatim,
+                  // 沙箱要求的环境变量（0.2.3）：宿主 env 作底，沙箱覆盖在上。
+                  // 没有 env 时不传这个键，让 Node 用默认继承（避免无谓地复制一大份 env）。
+                  ...(sandboxedEnv ? { env: { ...process.env, ...sandboxedEnv } } : {}),
                   // 非 Windows 上让子进程自成一个进程组，cancel 时才能整组杀干净；
                   // Windows 用 taskkill /T 走进程树，不需要这个。
                   detached: process.platform !== 'win32',
@@ -1152,16 +1195,17 @@ export function apply(ctx, config) {
       output: textOut(),
       async execute(args, exec) {
         const d = db();
+        // 只列自己的（审计 P0-3）：拿不到调用者身份时按原样全列（历史兼容）。
+        const caller = callerSessionId(exec);
         // 兜底探活：**只有 task_list 会写台账**（2026-11-27 issue #1 A1 ——
         // describe 曾也调它，但那是只读工具写终态，会把瞬时查不到的活任务打死）。
         // 0.2.2 起 subagent 和 job 两侧都扫：job 的结算事件在部分宿主上根本不存在，
         // 不主动问一次就会永远停在 running（审计 P2-8）。
-        const swept = sweepOnce(d);
+        // 0.2.3：传 caller 做归属隔离，只探活自己的任务，不改别人的状态（Gemini 补丁采纳）。
+        const { swept, suspects } = sweepOnce(d, caller);
         if (swept) log(`探活兜底：${swept} 条 subagent 任务原生已回收，补落 lost`);
         const sweptJobs = sweepJobsOnce(d);
         if (sweptJobs) log(`job 探活：${sweptJobs} 条已按原生状态补账`);
-        // 只列自己的（审计 P0-3）：拿不到调用者身份时按原样全列（历史兼容）。
-        const caller = callerSessionId(exec);
         const visible = (t) => {
           if (!caller) return true;
           const owner = t.ownerSessionId ? String(t.ownerSessionId) : null;
@@ -1170,9 +1214,11 @@ export function apply(ctx, config) {
         // 活动任务走 listActive（索引），终态按「最近 50 条」直接取窗口。
         // 0.2.0 之前是 listTasks({limit:500}) + 内存过滤排序：任务超过 500 条后
         // 活跃任务会掉出窗口，`task_list` 反而看不见在跑的东西（审计 P1-4）。
+        // 0.2.3：listRecent 传 caller —— 以前不传，别的会话新建 50 条就会把
+        // 当前会话的历史视图挤空（我自己在 0.2.1 文档里记的那条残留）。
         const wantAll = Boolean(args?.all);
         const pool = wantAll
-          ? d.listActive([...ACTIVE]).concat(d.listRecent(50))
+          ? d.listActive([...ACTIVE]).concat(d.listRecent(50, caller ?? undefined))
           : d.listActive([...ACTIVE]);
         const seen = new Set();
         const rows = [];
@@ -1184,7 +1230,17 @@ export function apply(ctx, config) {
           rows.push(t);
           if (rows.length >= 50) break;
         }
-        if (!rows.length) return { ok: true, text: '（无任务）' };
+        // suspects 要如实报（0.2.3）：探活阈值是两轮，用户得知道
+        // 「有条第一次没命中、再查一次才落终态」，而不是看到一个不透明的延迟。
+        const suspectNote = suspects
+          ? `（另有 ${suspects} 条 subagent 首次探活未命中；再 task_list 一次仍不命中将落 lost）`
+          : '';
+        if (!rows.length) {
+          const prefix = [];
+          if (swept) prefix.push(`（本轮探活补落 ${swept} 条 lost）`);
+          if (suspectNote) prefix.push(suspectNote);
+          return { ok: true, text: prefix.length ? `${prefix.join('\n')}\n（无任务）` : '（无任务）' };
+        }
         const lines = rows.map((t) =>
           `${t.id}  [${t.status}]  ${t.title}  (${t.type}${t.nativeId ? `/${t.nativeId}` : ''})  ${new Date(t.createdAt).toLocaleString()}`,
         );
@@ -1336,6 +1392,21 @@ export function apply(ctx, config) {
         if (!own.ok) return { ok: false, text: `任务不存在：${args?.taskId}` };
         const agentName = String(args?.agentId ?? '').trim();
         if (!agentName) return { ok: false, text: 'agentId 不能为空（原生 subagent 工具返回的 agent 名）' };
+        // 禁止对已绑定的活动任务二次覆盖登记（0.2.3，Gemini 补丁采纳）。
+        // 后果不只是台账被改：换一个 agent 就等于把这个任务绑到别处，
+        // 之后的 followup / 结算 / 取消全落到新目标上，原来那个还在跑。
+        // 例外：同一个 agent 名、但上次没解析出 session id —— 那是「补全」，允许。
+        if (row.nativeId && (row.status === 'running' || row.status === 'cancel_requested')) {
+          const canBackfill = row.nativeId === agentName && !row.nativeSessionId;
+          if (!canBackfill) {
+            return {
+              ok: false,
+              text: `任务已绑定到 agent ${row.nativeId}`
+                + `${row.nativeSessionId ? `（会话 ${row.nativeSessionId}）` : ''}，不能重复覆盖登记。`
+                + `要换目标请新建任务。`,
+            };
+          }
+        }
         // 原生 subagent 工具只回 "started subagent <name>"，拿不到会话 id；
         // 结算事件 subagent/end 只带会话 id。两边要接上，必须在这里把名字换成 id：
         //   0.2.2+ resolveName(caller, name) → SessionId
@@ -1706,10 +1777,37 @@ export function apply(ctx, config) {
               // 记 cancel_requested，交给重启对账 / 超时清账收尾，并如实说明。
               nativeOk = `探活失败（${String(probeErr?.message ?? probeErr).slice(0, 80)}），未能确认原生状态`;
             } else if (ag && typeof ag.cancel === 'function') {
-              ag.cancel({ kind: 'user' }, { keepInbox: true });
-              nativeOk = 'agent.cancel(keepInbox)';
+              // keepInbox: false（0.2.3，Gemini 补丁采纳）。
+              // 0.2.2 传的是 true —— 那是「暂停」语义：队列留着，之后还能继续。
+              // 而 task_cancel 是**取消**：用户说不干了，就不该把排队中的指令留着。
+              // 这个区别在真机上不一定看得出（多数 agent 取消后不会再消费队列），
+              // 但语义必须对：留队列 = 未来可能被 followup 唤醒继续跑。
+              ag.cancel({ kind: 'user' }, { keepInbox: false });
+              nativeOk = 'agent.cancel';
             } else if (ag) {
-              nativeOk = 'agent 无 cancel 方法，等 subagent/end 确认';
+              // agent 句柄没暴露 cancel → 退到 subagents.interruptByParent（0.2.3 补）。
+              // 这个方法是 cordis inspect 实测存在的，签名：
+              //   interruptByParent(childSessionId, parentSessionId, mode: 'continuable')
+              // 本机 0.2.1-rc.4 上 mode 只有 'continuable' 一个取值，所以照传。
+              // 注意它是同步返回 receipt 的，不是 async —— 但 await 一个非 Promise 也无害，
+              // 而另一版要是改成 async 也照样能用，所以这里统一 await。
+              const subSvc = (() => {
+                try { return typeof ctx.get === 'function' ? ctx.get('subagents') : undefined; } catch { return undefined; }
+              })();
+              if (typeof subSvc?.interruptByParent === 'function') {
+                try {
+                  await subSvc.interruptByParent(
+                    t.nativeSessionId,
+                    own.caller ?? t.ownerSessionId,
+                    'continuable',
+                  );
+                  nativeOk = 'subagents.interruptByParent';
+                } catch (e) {
+                  nativeOk = `interruptByParent 失败: ${String(e?.message ?? e).slice(0, 100)}`;
+                }
+              } else {
+                nativeOk = 'agent 无 cancel 方法，等 subagent/end 确认';
+              }
             } else if (!hasRealId && !t.nativeId) {
               // **从未绑定**（连 agent 名都没有）：没有任何原生执行单元可中断，
               // 也没有会到来的 subagent/end —— 以前这里被 `!hasRealId` 抢走，
@@ -1763,9 +1861,17 @@ export function apply(ctx, config) {
         // job：kill 调用即终局（原生契约），直接落 cancelled；
         // subagent：interrupt 只是「请求」，确认要等原生 subagent/end —— 两个状态分开（任务书表 3 / A07）。
         if (t.type === 'job' && nativeOk === 'killed') {
-          d.updateTaskFields(tid, { status: 'cancelled', currentStage: 'cancelled', errorSummary: reason, updatedAt: Date.now(), completedAt: Date.now() });
-          emitEvent(null, tid, 'task.cancelled', 'user', reason);
-          settleNotification(null, { id: tid, status: 'cancelled' });
+          // 先重读现状（0.2.3，Gemini 补丁采纳）：
+          // ctx.jobs.kill() 可能在**同一个调用栈里**同步触发 jobs.events 的 settled 回调，
+          // 那条路径已经把任务落成 cancelled 并写过事件和通知账了。
+          // 这里再写一遍会：重复发 task.cancelled 事件、并且在新状态上再覆盖一次 errorSummary。
+          // 已经终态就什么都不做。
+          const cur = d.getTask(tid);
+          if (!cur || !TERMINAL.has(cur.status)) {
+            d.updateTaskFields(tid, { status: 'cancelled', currentStage: 'cancelled', errorSummary: reason, updatedAt: Date.now(), completedAt: Date.now() });
+            emitEvent(null, tid, 'task.cancelled', 'user', reason);
+            settleNotification(null, { id: tid, status: 'cancelled' });
+          }
           t.status = 'cancelled';
         } else {
           d.updateTaskFields(tid, { status: 'cancel_requested', currentStage: 'cancelling', errorSummary: reason, updatedAt: Date.now() });
@@ -2058,7 +2164,22 @@ export function apply(ctx, config) {
           // 正确判据：重启（本函数只在 apply() 里跑）意味着上一个进程内的 agent 全没了。
           // 没有 session id 就无法重新接上它 —— 所以这里应当落 lost，而不是假装活着。
           // 想在重启后继续跑的，只能在运行时用 task_cancel 收尾，或重新建任务。
-          alive = t.nativeSessionId ? !!getAgentHandle(ctx, t) : false;
+          //
+          // 探活**抛异常**时不许判 lost（0.2.3，Gemini 补丁采纳）：
+          // 那是「没问成」，不是「问到了没人」。外面那层 `catch { alive = false }`
+          // 会把异常直接当死，于是重启一次全标 lost —— 和我 0.2.1 修的三处崩溃点
+          // 是同一类错误：把「查询失败」当成「对象不存在」。这里单独接，
+          // 按「暂不判断」处理（保持原状态，下轮维护循环再核）。
+          if (!t.nativeSessionId) {
+            alive = false;
+          } else {
+            try {
+              alive = !!getAgentHandle(ctx, t);
+            } catch (err) {
+              log(`启动对账跳过 ${t.id}（查询 agent 异常，暂不判 lost）：${String(err).slice(0, 120)}`);
+              alive = true;
+            }
+          }
         } else {
           alive = false;
         }

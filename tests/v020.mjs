@@ -1172,6 +1172,100 @@ const rm = (p) => { try { fs.rmSync(p, { recursive: true, force: true, maxRetrie
   rm(home);
 }
 
+// ---------------------------------------------------------------------------
+// 19. 0.2.3（Gemini 补丁采纳）：GBK 两个边界 + 归属隔离 + cancel 语义
+// ---------------------------------------------------------------------------
+{
+  // 19.1–19.2 解码器边界：直接拿 index.js 里的 makeChunkDecoder 做单元测试
+  const src = fs.readFileSync(new URL('../index.js', import.meta.url), 'utf8');
+  const s0 = src.indexOf('function makeChunkDecoder()');
+  const s1 = src.indexOf('// ---------------------------------------------------------------------------\n// 台账存储');
+  const mk = new Function(src.slice(s0, s1) + '; return makeChunkDecoder;')();
+
+  // 「A中」= 41 D6 D0 一次给完：旧实现 end() 直接 toString('utf8') 会出 "A��"
+  const d1 = mk();
+  const o1 = d1(Buffer.from([0x41, 0xD6, 0xD0])) + d1.end();
+  ok('19.1 短 GBK 单包（A中）正确解码', o1 === 'A中', JSON.stringify(o1));
+
+  // 「丂」= 81 40 跨包：0x40 落在 ASCII 区，旧实现会旁路 pending 提前吐出 → 乱序乱码
+  const d2 = mk();
+  const o2 = d2(Buffer.from([0x81])) + d2(Buffer.from([0x40, 0x0A])) + d2.end();
+  ok('19.2 次字节落在 ASCII 区的跨包汉字不乱码', o2.includes('丂'), JSON.stringify(o2));
+
+  // 原有能力不许退化
+  const d3 = mk();
+  const o3 = d3(Buffer.from('ABC\n', 'utf8')) + d3(Buffer.from([0xD6, 0xD0, 0xCE, 0xC4, 0x0A])) + d3.end();
+  ok('19.3 先 ASCII 后 GBK 仍然正确', o3.includes('中文'), JSON.stringify(o3));
+}
+
+{
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'v023-iso-'));
+  const saved = { U: process.env.USERPROFILE, H: process.env.HOME, P: process.env.DSH_PROFILE_DIR, L: process.env.DSH_COORD_LIMITS };
+  process.env.USERPROFILE = home; process.env.HOME = home;
+  process.env.DSH_PROFILE_DIR = path.join(home, '.dsh', 'profiles', 'iso');
+  delete process.env.DSH_PROFILE;
+  delete process.env.DSH_COORD_LIMITS;
+
+  const mod = await import(`${ROOT}/index.js?sec=iso`);
+  const R = {}, cancelArgs = {};
+  const alive = new Set();
+  const ctx = mkCtx({
+    logger: { info: () => {} },
+    jobs: { start() { return 'nj'; }, get() { return { status: 'running' }; }, readAt() { return { chunks: [] }; }, kill() {}, events: { subscribe() { return () => {}; } } },
+    agents: {
+      get(id) { return alive.has(id) ? { status: {}, followup() {}, steer() {}, cancel(a, b) { cancelArgs[id] = b; } } : undefined; },
+    },
+    workingDirectory: { ensure: async () => process.cwd() },
+    sandboxPolicy: { resolve: async () => ({ mode: 'danger-full-access' }) },
+    sandbox: { confine: async (a) => ({ argv: a }) },
+    tools: { register(t) { R[t.name] = t; } }, on() { return () => {}; },
+  });
+  mod.default.apply(ctx, { global: 20, perOwner: 20, timeoutMinutes: 120, sweepSeconds: 600, retentionDays: 30 });
+  const dbp = path.join(home, '.dsh', 'background-task-coordinator', 'iso', 'tasks.db');
+  const { DatabaseSync } = await import('node:sqlite');
+  const get1 = (sql, ...a) => { const ro = new DatabaseSync(dbp, { readOnly: true }); const v = ro.prepare(sql).get(...a); ro.close(); return v; };
+  const set = (sql, ...a) => { const w = new DatabaseSync(dbp); w.prepare(sql).run(...a); w.close(); };
+
+  const A = { agent: { id: 'owner-A', session: { id: 'owner-A' } } };
+  const B = { agent: { id: 'owner-B', session: { id: 'owner-B' } } };
+
+  // 19.4 归属隔离：B 调 task_list 不许把 A 的任务探活掉
+  let r = await R.task_create.execute({ type: 'subagent', title: 'A的任务', objective: 'x' }, A);
+  const tA = r.text.match(/taskId=([\w-]+)/)?.[1];
+  await R.task_register_delegation.execute({ taskId: tA, agentId: 'agA', sessionId: 'sess-GONE-A' }, A);
+  set("UPDATE tasks SET native_session_id='sess-GONE-A', status='running' WHERE id=?", tA);
+  // B 连查两轮
+  await R.task_list.execute({ all: true }, B);
+  await R.task_list.execute({ all: true }, B);
+  ok('19.4 别人的会话扫描不会动我的任务', get1("SELECT status FROM tasks WHERE id=?", tA).status === 'running',
+    get1("SELECT status FROM tasks WHERE id=?", tA).status);
+  // A 自己查两轮才落 lost
+  await R.task_list.execute({ all: true }, A);
+  await R.task_list.execute({ all: true }, A);
+  ok('19.5 自己的会话查两轮能收掉', get1("SELECT status FROM tasks WHERE id=?", tA).status === 'lost',
+    get1("SELECT status FROM tasks WHERE id=?", tA).status);
+
+  // 19.6 cancel 传 keepInbox:false（取消不是暂停）
+  r = await R.task_create.execute({ type: 'subagent', title: 'to-cancel', objective: 'x' }, A);
+  const tK = r.text.match(/taskId=([\w-]+)/)?.[1];
+  await R.task_register_delegation.execute({ taskId: tK, agentId: 'agK', sessionId: 'sess-K' }, A);
+  set("UPDATE tasks SET native_session_id='sess-K', status='running' WHERE id=?", tK);
+  alive.add('sess-K');
+  await R.task_cancel.execute({ taskId: tK, reason: 'kill it' }, A);
+  ok('19.6 cancel 传 keepInbox:false（不留队列）', cancelArgs['sess-K']?.keepInbox === false,
+    JSON.stringify(cancelArgs['sess-K']));
+
+  // 19.7 已绑定的活动任务不许被二次登记换目标
+  const r2 = await R.task_register_delegation.execute({ taskId: tK, agentId: 'ag-OTHER', sessionId: 'sess-OTHER' }, A);
+  ok('19.7 已绑定任务拒绝换目标重登记', !r2.ok && r2.text.includes('不能重复覆盖'), r2.text.slice(0, 40));
+
+  if (saved.U !== undefined) process.env.USERPROFILE = saved.U;
+  if (saved.H !== undefined) process.env.HOME = saved.H;
+  if (saved.P !== undefined) process.env.DSH_PROFILE_DIR = saved.P;
+  if (saved.L !== undefined) process.env.DSH_COORD_LIMITS = saved.L;
+  rm(home);
+}
+
 console.log('=== 0.2.0 专项 ===');
 console.log(P.join('\n'));const pass = P.filter((x) => x.startsWith('✅')).length;
 console.log(`\n通过 ${pass}/${P.length}`);

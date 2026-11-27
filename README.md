@@ -241,12 +241,12 @@ background jobs unavailable: no job controller serves this agent
 | `stopReason` 空串落 `failed` | 假失败（和以前假成功一样糟） | 按宿主真实枚举映射，空串落 `succeeded` 但注明「未给出原因」 |
 | **`cmd /s /c` 把引号拼成字面量**（新发现） | 任何带引号/带空格的命令都报 `Cannot find module '..."..."'` | `spawn` 加 `windowsVerbatimArguments`（仅 danger-full-access 分支） |
 
-测试三套，**110 项全绿**（0.2.2 起）：
+测试三套，**117 项全绿**（0.2.3 起）：
 
 ```
 主回归      16/16
 下游补丁     9/9
-专项       85/85
+专项       92/92
 ```
 
 其中几条是专门设计成「能反驳自己」的——比如断言旧 `listTasks({limit:500})` 写法在 601 条台账下**确实漏掉活动任务**，用来证明修的是真 bug。迁移那条用本机真实旧库（含 2.1 MB WAL）跑过：29 任务 / 53 事件 / 5 消息全保留。
@@ -304,6 +304,31 @@ background jobs unavailable: no job controller serves this agent
 - 独立 argv 调 `taskkill` → **必须** false（否则路径被劈开）
 
 不能一刀切，按 argv 的来源决定。
+
+## 九点八、0.2.3 改了什么
+
+这一版的来源不同：不是我找的问题，是一份别人写的 0.2.1 补丁（Gemini 生成，1900 行）。逐段对比自己的实现后**采纳了七条它比我做得好的**：
+
+| 问题 | 我原来的状态 | 现状 |
+|---|---|---|
+| GBK 积压时纯 ASCII 旁路 pending | 跨包汉字被劈开 + 乱序（实测出 `"@\n�"`） | 只在无积压时才走快路 |
+| `end()` 对残留字节硬走 UTF-8 | 短 GBK 出 `"A��"` | 严格试一次，过不了走 gbk |
+| `given` 放行 `current` 这类占位词 | 能过长度检查，`current` 又是默认值 | 显式排除 |
+| 父会话 id 被当子会话 id | 该任务永远匹配不上 `subagent/end` | 排除自指 |
+| `sweepOnce` 跨会话写别人台账 | A 调 `task_list` 能把 B 的任务标 lost | 传 caller 做归属隔离 |
+| `listRecent` 没按 caller 过滤 | 别的会话新建 50 条挤空当前视图 | 传 caller |
+| `cancel` 传 `keepInbox: true` | 那是「暂停」语义，队列留着还能被唤醒 | 改 `false`，并兜底 `interruptByParent` |
+| 二次登记不拦 | 换 agent 等于把任务绑到别处，原来那个还在跑 | 拒绝换目标（允许补全 session id） |
+| 启动对账探活抛错判 lost | 「没问成」被当成「问到了没人」 | 单独接，暂不判断 |
+| `sandboxed.env` 未透传 | 只吃 argv 不吃 env = 半套隔离 | 宿主 env 作底、沙箱覆盖 |
+
+前两条是**先复现再修**的：把 0.2.2 的旧解码器单独抄出来跑，确认两个用例都乱码，改完再验。
+
+### 没采纳的
+
+- `settleNotification` 仍只记账 —— 我 0.2.2 已改成真投递，比它进一步
+- 没有 `sweepJobsOnce` —— 我 0.2.2 新增的 job 探活它没有
+- 把 `db()`/`emitEvent` 等模块级函数全挪进 `apply` —— 思路对（解决热重载互相覆写），但改动 300+ 行、风险集中，记进待办单独做
 
 ## 十、许可
 

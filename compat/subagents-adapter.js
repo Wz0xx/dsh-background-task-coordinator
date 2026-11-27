@@ -43,26 +43,36 @@ export async function resolveSubagentSessionId(ctx, agentName, caller, given) {
   const name = String(agentName ?? '').trim();
   if (!name) return null;
 
+  // 父会话 id 一次算好，两处都要用（0.2.3，Gemini 补丁采纳）：
+  // 三个字段形状都认 —— caller.session.id / caller.sessionId / caller.id。
+  // 0.2.2 只在下面的 listChildren 路径里取，导致「拿 given 做自指检查」这一步做不到。
+  const parentSid = caller?.session?.id ?? caller?.sessionId ?? caller?.id ?? null;
+
   // 调用方明确给了、且不等于 agent 名 → 要用，但**先核实它真的是一个会话 id**
-  // （0.2.1 修，审计 P1-6）。
+  // （0.2.1 修 P1-6，0.2.3 补两个漏网）。
   //
   // 0.2.0 是「给了就信」：`if (g && g !== name) return g;` 直接原样落库。
   // 问题是这个字段由模型填，什么都能塞进去 —— 一个随手写的「随便」「abc」会被当成
   // 会话 id 存进 native_session_id，之后所有按 id 的探活、结算匹配、取消全部落空。
   //
-  // 0.2.1 的判据要**松到不打断正常时序**（原生工具刚返回 sessionId 时，
-  // agents 注册表往往还没登记；测试/其它宿主也可能用 `sess-xxx` 这种短 id）：
-  //   ① 排除明显不是 id 的（空串、纯中文、带空格、超短）；
-  //   ② 注册表能查到 → 确认；查不到 → 接受但算「未核实」，不当成已确认。
-  // 只有真正不像 id 的才丢掉、进反查。这一条是被测试逼出来的：一开始写成
-  // 「必须是 UUID」，结果 `sess-F1` 这种合法短 id 被打断，补投直接失效。
+  // 判据要**松到不打断正常时序**（原生工具刚返回 sessionId 时，agents 注册表往往还没登记；
+  // 测试/其它宿主也可能用 `sess-xxx` 这种短 id）：
+  //   ① 排除占位字面量（current/null/undefined/none/unknown）—— 0.2.3 补：
+  //      这些词能过长度检查，但它们**绝不是 id**，而且 `current` 恰好是
+  //      task_create 的 conversationId 默认值，最容易混进来；
+  //   ② 排除「父会话自己」—— 0.2.3 补：把父 id 当成子会话 id 落库，
+  //      会让这个任务永远匹配不上真正的 subagent/end（事件带的是子会话 id）；
+  //   ③ 排除明显是话不是 id 的（空、含空格、纯中文、长度 < 4）；
+  //   ④ 注册表能查到 → 确认；查不到 → 接受但算「未核实」，不当成已确认。
   const g = String(given ?? '').trim();
   if (g && g !== name) {
+    const isPlaceholder = /^(current|null|undefined|none|unknown)$/i.test(g);
+    const isParentItself = !!parentSid && g === String(parentSid);
     // 「像 id」= 无空白、非全中文、长度 >= 4。
     // 会话 id 的真实形态在这些宿主里并不统一（UUID、session-xxx、sess-F1 都见过），
     // 所以不能按某一种格式硬卡，只能排除明显是话而不是 id 的。
     const looksLikeId = g.length >= 4 && !/\s/.test(g) && !/^[\u4e00-\u9fa5]+$/.test(g);
-    if (looksLikeId) {
+    if (!isPlaceholder && !isParentItself && looksLikeId) {
       const agents = (() => {
         try { return typeof ctx?.get === 'function' ? ctx.get('agents') : undefined; } catch { return undefined; }
       })();
@@ -74,7 +84,7 @@ export async function resolveSubagentSessionId(ctx, agentName, caller, given) {
       // 格式过得去、注册表暂时查不到（或没有 agents 服务）：接受，但未核实。
       return g;
     }
-    // 不像 id：进反查，别把它当 id 落库。
+    // 不像 id / 是占位词 / 是父会话自己：进反查，别把它当 id 落库。
   }
 
   const sub = getSubagentsService(ctx);
@@ -92,11 +102,9 @@ export async function resolveSubagentSessionId(ctx, agentName, caller, given) {
 
   // ---- 路径二：0.2.1 的 listChildren（扫父会话的子级目录，按 label 匹配） ----
   //
-  // 父会话 id 的取法要全（0.2.1 修，审计 P1-6）：0.2.0 只认 `caller.session.id`
-  // 和 `caller.sessionId`，漏了 `caller.id` —— 而空态兜底造出来的 caller 恰恰是
-  // `{ session: {...}, id }` 形态，别的宿主也可能只给 .id。
-  // 结果：`{ id: 'parent-only-id' }` 这种 caller 会让这条路径整个跳过、直接返回 null。
-  const parentSid = caller?.session?.id ?? caller?.sessionId ?? caller?.id ?? null;
+  // parentSid 在函数开头就算好了（0.2.3 提到上面，因为「排除父会话自己」那一步也要它）。
+  // 取法要全：0.2.0 只认 `caller.session.id` 和 `caller.sessionId`，漏了 `caller.id` ——
+  // 而空态兜底造出来的 caller 恰恰是 `{ session: {...}, id }` 形态，别的宿主也可能只给 .id。
   if (typeof sub.listChildren === 'function' && parentSid) {
     try {
       const kids = await sub.listChildren(parentSid);
