@@ -299,7 +299,13 @@ export function getAgentHandle(ctx, task) {
   // 只让「服务取不到」退化为 undefined；get 本身抛错就让它冒出去，
   // 调用方据此判断「这次探活没做成」（而不是「agent 没了」）。
   const agents = (() => {
-    try { return typeof ctx?.get === 'function' ? ctx.get('agents') : ctx?.agents; }
+    try {
+      // 0.2.7：必须 strict=false。默认 strict 只返回 fiber 已 ACTIVE 的服务，
+      // agents 未必在插件加载时 ACTIVE → 返回 undefined → **所有探活都判「查不到」**，
+      // 活任务被当成已死。这条比自检误报严重：它直接决定任务状态。
+      if (typeof ctx?.get !== 'function') return ctx?.agents;
+      return ctx.get('agents', false) ?? ctx.get('agents');
+    }
     catch { return undefined; }
   })();
   if (!agents || typeof agents.get !== 'function') return undefined;

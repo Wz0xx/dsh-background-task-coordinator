@@ -2466,6 +2466,66 @@ const rm = (p) => { try { fs.rmSync(p, { recursive: true, force: true, maxRetrie
   }
 }
 
+// ---------------------------------------------------------------------------
+// 30. 0.2.7 复查补漏：getAgentHandle 也必须 strict=false
+//     否则 agents 的 fiber 未 ACTIVE 时，所有探活都返回「查不到」→ 活任务被判死
+// ---------------------------------------------------------------------------
+{
+  const { notActive } = await import('./mockctx.mjs');
+  const { getAgentHandle } = await import(`${ROOT}/compat/subagents-adapter.js`);
+
+  // agents 服务存在、但 fiber 未 ACTIVE，里面确实有这个 agent
+  {
+    const ctx = mkCtx({
+      agents: notActive({ get: (id) => (id === 'sess-ALIVE' ? { status: {}, name: 'w' } : undefined) }),
+    });
+    const h = getAgentHandle(ctx, { nativeSessionId: 'sess-ALIVE', nativeId: 'w' });
+    ok('30.1 agents fiber 未 ACTIVE 时，探活仍能拿到 handle', !!h, h ? '拿到' : '拿不到（会误判死活）');
+  }
+
+  // 真的没有这个 agent → undefined（不能因为放宽 strict 就假装存在）
+  {
+    const ctx = mkCtx({ agents: notActive({ get: () => undefined }) });
+    const h = getAgentHandle(ctx, { nativeSessionId: 'sess-GONE', nativeId: 'w' });
+    ok('30.2 真的没有时仍返回 undefined', h === undefined);
+  }
+
+  // agents.get 本身抛错 → 让它冒出去（调用方要能区分「查询失败」和「查不到」）
+  {
+    const ctx = mkCtx({ agents: notActive({ get: () => { throw new Error('registry boom'); } }) });
+    let threw = false;
+    try { getAgentHandle(ctx, { nativeSessionId: 'sess-X', nativeId: 'w' }); } catch { threw = true; }
+    ok('30.3 agents.get 抛错时不被吞掉（调用方要能区分）', threw);
+  }
+
+  // 无 agents 服务 → undefined，不崩
+  {
+    const ctx = mkCtx({});
+    const h = getAgentHandle(ctx, { nativeSessionId: 'sess-Y', nativeId: 'w' });
+    ok('30.4 无 agents 服务时返回 undefined 且不崩', h === undefined);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 31. 0.2.7 复查：补投路径与正常投递路径的正文上限必须一致
+//     正常投递存 16000，补投却砍到 500 —— 投出去的完整、存下来的残缺，审计对不上
+// ---------------------------------------------------------------------------
+{
+  const srcC = fs.readFileSync(new URL('../index.js', import.meta.url), 'utf8');
+  const shortSlices = (srcC.match(/content: redactSecrets\(m\.content\)\.slice\(0, (\d+)\)/g) || []);
+  const limits = shortSlices.map((x) => Number(x.match(/slice\(0, (\d+)\)/)[1]));
+  ok('31.1 补投/取消路径的正文上限不是 500（与正常投递一致）',
+    limits.length > 0 && limits.every((n) => n >= 16000),
+    `找到 ${limits.length} 处，limit=${[...new Set(limits)].join(',')}`);
+
+  // 反向确认：正常投递路径也在用同一个上限
+  const normalSlices = (srcC.match(/content: content\.slice\(0, (\d+)\)/g) || []);
+  const nLimits = normalSlices.map((x) => Number(x.match(/slice\(0, (\d+)\)/)[1]));
+  ok('31.2 正常投递路径同样是 16000（两处一致）',
+    nLimits.length > 0 && nLimits.every((n) => n === 16000),
+    `找到 ${nLimits.length} 处，limit=${[...new Set(nLimits)].join(',')}`);
+}
+
 console.log('=== 0.2.0 专项 ===');
 console.log(P.join('\n'));
 const pass = P.filter((x) => x.startsWith('✅')).length;

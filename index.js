@@ -1644,7 +1644,7 @@ export function apply(ctx, config) {
               for (const m of pend) {
                 d.updateMessage(m.messageId, {
                   status: 'cancelled',
-                  content: redactSecrets(m.content).slice(0, 500),
+                  content: redactSecrets(m.content).slice(0, 16000),
                   reason: '任务在绑定前已结束（subagent/end 早到），取消待补投指令',
                 });
                 emitEvent(null, tid, 'task.message_cancelled', 'coordinator', `早到结算取消补投 ${m.messageId}`);
@@ -1674,7 +1674,7 @@ export function apply(ctx, config) {
                   d.updateMessage(m.messageId, {
                     status: 'delivered',
                     channel: 'agent-inbox-flush',
-                    content: redactSecrets(m.content).slice(0, 500),
+                    content: redactSecrets(m.content).slice(0, 16000),
                     deliveredAt: Date.now(),
                   });
                   emitEvent(null, tid, 'task.message_flushed', 'coordinator', `补投 ${m.messageId}`);
@@ -1682,7 +1682,7 @@ export function apply(ctx, config) {
                 } catch (e) {
                   d.updateMessage(m.messageId, {
                     status: 'undeliverable',
-                    content: redactSecrets(m.content).slice(0, 500),
+                    content: redactSecrets(m.content).slice(0, 16000),
                     reason: `补投失败: ${String(e).slice(0, 120)}`,
                   });
                   emitEvent(null, tid, 'task.message_failed', 'coordinator', `补投失败 ${m.messageId}`);
@@ -1961,7 +1961,7 @@ export function apply(ctx, config) {
             for (const m of d.listPendingMessages(tid)) {
               d.updateMessage(m.messageId, {
                 status: 'cancelled',
-                content: redactSecrets(m.content).slice(0, 500),
+                content: redactSecrets(m.content).slice(0, 16000),
                 reason: '任务已取消，清理待补投指令',
               });
             }
@@ -2321,9 +2321,14 @@ export function apply(ctx, config) {
         const svcOf = (k) => {
           // inject 过的（jobs/agents/tools）直取没问题，也允许直取；
           // 其余走 get()。两条都试，取到就用，取不到记原因。
+          //
+          // 0.2.7：这里也必须 strict=false。
+          // 这是**诊断工具**，误报的代价最大——它会告诉人「这个服务不存在」，
+          // 而实际上只是 fiber 没 ACTIVE。之前就因为没传，task_probe 对
+          // workingDirectory / sandbox* 永远只回一行 undefined。
           try {
             if (typeof ctx.get === 'function') {
-              const viaGet = ctx.get(k);
+              const viaGet = ctx.get(k, false) ?? ctx.get(k);
               if (viaGet) return { v: viaGet, via: 'ctx.get' };
             }
           } catch { /* 落到直取 */ }
