@@ -1,4 +1,15 @@
 - insert:
     - id: background-task-coordinator
       name: dsh-background-task-coordinator
-      config: {}
+      config:
+        # 0.2.0 起 apply(ctx, config) 真的读这份配置；不写就是下面这几个默认值。
+        # （0.1.x 的 apply 只收一个参数，写在这里的键会被静默忽略。）
+        #
+        # retentionDays：终态任务完成超过这么多天就删（连事件/消息/幂等账一起清）。
+        #   默认 30。设 0 关掉清理——要长期留证据时才这么干。
+        #   以前这个清理根本没被调用过，台账只增不减，到 500 条之后结算事件会开始丢（审计 P1-4）。
+        retentionDays: 30
+        # 单个任务超过这么多分钟没收尾，请求取消（默认 120）
+        timeoutMinutes: 120
+        # 维护循环间隔秒数（默认 300）
+        sweepSeconds: 300

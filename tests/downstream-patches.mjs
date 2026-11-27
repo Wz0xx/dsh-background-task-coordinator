@@ -2,6 +2,8 @@ import { mkCtx } from './mockctx.mjs';
 import fs from 'node:fs'; import os from 'node:os'; import path from 'node:path';
 const fakeHome = fs.mkdtempSync(path.join(os.tmpdir(),'pt-'));
 process.env.USERPROFILE=fakeHome; process.env.HOME=fakeHome;
+process.env.DSH_PROFILE_DIR = path.join(fakeHome, '.dsh', 'profiles', 'ptest');
+delete process.env.DSH_PROFILE;
 process.env.DSH_COORD_LIMITS = JSON.stringify({global:20, perOwner:20, timeoutMinutes:120, sweepSeconds:600});
 const mod = await import('file:///C:/Users/stop/.dsh/worlds/default/room/background-task-coordinator/index.js');
 const R={}, log=[], alive=new Set();
@@ -17,7 +19,7 @@ const ctx = mkCtx({
   sandbox:{confine:async a=>({argv:a})},
 });
 mod.default.apply(ctx,{});
-const dbp = path.join(fakeHome,'.dsh/background-task-coordinator/tasks.db');
+const dbp = path.join(fakeHome,'.dsh/background-task-coordinator/ptest/tasks.db');
 const { DatabaseSync } = await import('node:sqlite');
 const get1=(sql,...a)=>{const ro=new DatabaseSync(dbp,{readOnly:true});const v=ro.prepare(sql).get(...a);ro.close();return v;};
 const P=[]; const ok=(n,c,d='')=>P.push(`${c?'✅':'❌'} ${n}${d?`  (${d})`:''}`);

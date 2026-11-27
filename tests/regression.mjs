@@ -3,6 +3,9 @@ import fs from 'node:fs'; import os from 'node:os'; import path from 'node:path'
 
 const fakeHome = fs.mkdtempSync(path.join(os.tmpdir(),'reg-'));
 process.env.USERPROFILE = fakeHome; process.env.HOME = fakeHome;
+// 0.2.0 起库按 profile 隔离：设 DSH_PROFILE_DIR 才能落到 <tag>/tasks.db 下
+process.env.DSH_PROFILE_DIR = path.join(fakeHome, '.dsh', 'profiles', 'regtest');
+delete process.env.DSH_PROFILE;
 process.env.DSH_COORD_LIMITS = JSON.stringify({global:20, perOwner:20, timeoutMinutes:120, sweepSeconds:600});
 const mod = await import('file:///C:/Users/stop/.dsh/worlds/default/room/background-task-coordinator/index.js');
 
@@ -27,7 +30,7 @@ mod.default.apply(ctx, {});
 const execA = { agent:{ id:'sess-A', session:{ id:'sess-A' } } };
 const execB = { agent:{ id:'sess-B', session:{ id:'sess-B' } } };
 const P=[]; const ok=(n,c,d='')=>P.push(`${c?'✅':'❌'} ${n}${d?`  (${d})`:''}`);
-const dbp = path.join(fakeHome,'.dsh/background-task-coordinator/tasks.db');
+const dbp = path.join(fakeHome,'.dsh/background-task-coordinator/regtest/tasks.db');
 const { DatabaseSync } = await import('node:sqlite');
 const set = (sql, ...args) => { const w = new DatabaseSync(dbp); w.prepare(sql).run(...args); w.close(); };
 const get1 = (sql, ...args) => { const ro = new DatabaseSync(dbp,{readOnly:true}); const v = ro.prepare(sql).get(...args); ro.close(); return v; };
@@ -42,10 +45,12 @@ ok('A2 confine 真的被调用', confined.length>0, `${confined.length} 次`);
 r = await R.task_describe.execute({taskId:t1}, execA);
 ok('B describe 有事件与发起行', r.text.includes('最近事件') && r.text.includes('发起：'));
 
-// C 幂等
-await R.task_append_message.execute({taskId:t1, content:'x', idempotencyKey:'K'}, execA);
+// C 幂等（0.2.0 语义改了：只有 delivered / cancelled 才挡重试）
+//   C1 job 的 undeliverable 不锁死重试：两次同样的显式键都真跑一遍流程
 r = await R.task_append_message.execute({taskId:t1, content:'x', idempotencyKey:'K'}, execA);
-ok('C 幂等键命中', r.text.includes('幂等命中'));
+const c1 = r.text;
+r = await R.task_append_message.execute({taskId:t1, content:'x', idempotencyKey:'K'}, execA);
+ok('C1 undeliverable 不锁死重试', !r.text.includes('幂等命中') && r.text.includes('未投递'), r.text.slice(0,40));
 
 // D 越权
 r = await R.task_describe.execute({taskId:t1}, execB);

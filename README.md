@@ -98,7 +98,7 @@ background jobs unavailable: no job controller serves this agent
 ```
 [task-coordinator] 后台作业：可用
 [task-coordinator] 系统提示已加一段（order=1600）
-[task-coordinator] 已注册 8 个工具（7 任务 + task_probe 诊断），数据目录 C:\Users\<你>\.dsh\background-task-coordinator
+[task-coordinator] 已注册 8 个工具（7 任务 + task_probe 诊断），数据目录 C:\Users\<你>\.dsh\background-task-coordinator\<profile>
 ```
 
 第一行是启动自检（0.1.1 起有）：启动时先探 `ctx.jobs.start` 在不在。看到「后台作业：不可用——ctx.jobs.start 不存在」就是第二节那个硬前提没满足，先去补 `dsh-tool-jobs`，别的都不用查。
@@ -144,8 +144,24 @@ background jobs unavailable: no job controller serves this agent
 1. **重启 DSH 后，正在跑的 job 会丢。** `dsh-jobs-local` 是纯内存的，宿主一死作业就没了。台账会把它标成 `lost`——不假装还在跑，但任务本身要重起。
 2. **不自动劫持命令。** 插件只在系统提示里写了「默认扔后台」的判据，决定权在模型手里。不做「看到 `npm test` 就偷偷改成后台」——技术上只能取消+重建，模型会拿不到结果、以为命令失败了，那比不做更糟。
 3. **Windows 主要路径实测过。** GBK 解码、`taskkill /T` 这些都有平台分支，Linux / macOS 没测。
-4. **数据是一个 SQLite 库**：`~/.dsh/background-task-coordinator/tasks.db`（WAL 模式）。可以直接看（`node:sqlite` 或任意 sqlite3 客户端）、直接删——删了下次启动重建空账，不影响 DSH。旧版的 `tasks.json` 会在首次启动时自动迁进来，迁完改名 `.migrated` 保留。
-5. **限额与超时可配**：环境变量 `DSH_COORD_LIMITS`（JSON），如 `{"global":3,"perOwner":2,"timeoutMinutes":120,"sweepSeconds":300}`。超限额的建任务请求被明确拒绝（不绕过）；过 deadline 的活动任务先请求取消，等执行器确认后落终态。
+4. **数据是一个 SQLite 库**：`~/.dsh/background-task-coordinator/<profile>/tasks.db`（WAL 模式）。可以直接看（`node:sqlite` 或任意 sqlite3 客户端）、直接删——删了下次启动重建空账，不影响 DSH。
+
+   **0.2.0 起按 profile 隔离。** 以前所有 profile 共用一个库，开第二个 profile 时它的启动对账查不到第一个 profile 内存里的 job/agent，会把正在跑的任务全标 `lost`。现在路径里带 profile 名（取 `DSH_PROFILE_DIR` 的 basename，没有就用 `DSH_PROFILE`，都没有是 `default`）。**旧库不会自动搬**——串台路径不清不楚，搬错比不搬更糟；要留老数据就手动 copy 到新目录（连同 `-wal`、`-shm` 一起）。
+
+   旧版的 `tasks.json` 会在首次启动时自动迁进来，迁完改名 `.migrated` 保留。
+
+5. **限额与超时可配**，三层来源，后者盖前者：内置默认 → `cordis.patch.yml` 的 `config` → 环境变量 `DSH_COORD_LIMITS`（JSON）。
+
+   ```yaml
+   config:
+     retentionDays: 30     # 终态任务完成超过几天就删（连事件/消息/幂等账），0 = 不清
+     timeoutMinutes: 120   # 单个任务超时分钟数
+     sweepSeconds: 300     # 维护循环间隔
+   ```
+
+   超限额的建任务请求被明确拒绝（不绕过）；过 deadline 的活动任务先请求取消，等执行器确认后落终态。配置里写了垃圾值（字符串、空、对象）一律退回默认，不会让定时器退化成死循环。
+
+6. **台账会自动清理**。0.2.0 之前 `purgeHistoryOlderThan()` 定义了却从没被调用，台账只增不减——到 500 条之后，结算事件会开始永久丢失。现在维护循环每轮顺带清一次，保留天数见上。
 
 ---
 
@@ -206,6 +222,34 @@ background jobs unavailable: no job controller serves this agent
 - **DSH 0.2.2-rc3：适配**（0.1.3 起）。0.2.2 收紧了 job 注册表的 owner 校验（`start(spec)` 强制解析 `spec.owner` 的活 agent，且有主 job 的 kill/readAt/get 按 owner 围栏）——0.1.3 起插件按真实会话 id 传 owner 并全程带 caller。0.1.2 及更早版本在 0.2.2 上 `type=job` 会报 `no job controller serves this agent`。
 - Node ≥ 22.16（`node:sqlite` 需要）
 - 零核心改动，纯插件层
+
+---
+
+## 九点五、0.2.0 改了什么
+
+七条收尾 + 一个做测试时撞出来的真 bug，逐条见 `docs/0.2.0改动记录-20261127.md`。挑最要紧的说：
+
+| 问题 | 后果 | 现状 |
+|---|---|---|
+| 8 处 `LIMIT 500` 全表截断 | 任务超 500 条后，**结算事件永久丢失** | 全改定向查询，补 `native_session_id` 索引 |
+| `purgeHistoryOlderThan` 从没被调用 | 台账只增不减，必然撞上面那条 | 接进维护循环，幂等表一起清 |
+| 幂等键是全表 `UNIQUE` | 跨任务用同一显式键 → 消息投出去了但库里没记录 | 重建表，改 `(task_id, key)` 联合唯一（带 meta 版本迁移） |
+| `pending` 消息不 flush | 绑定前排队的指令永久卡死，且重发被幂等挡住 | 绑定后真补投；非 `delivered` 不再锁死重试 |
+| GBK 首次判编码就锁定 | 先吐 ASCII 再吐中文 → 全程乱码 | 改单流持久化解码器 + `end()` 收尾 |
+| 多 profile 共用一个库 | 开第二个 profile 会把第一个的任务全标 `lost` | 按 profile 隔离路径；加 `busy_timeout` |
+| `dispose()` 不关 `_sqlite` | 重载累积连接、`-wal` 永不 checkpoint | 关库 + `wal_checkpoint(TRUNCATE)` |
+| `stopReason` 空串落 `failed` | 假失败（和以前假成功一样糟） | 按宿主真实枚举映射，空串落 `succeeded` 但注明「未给出原因」 |
+| **`cmd /s /c` 把引号拼成字面量**（新发现） | 任何带引号/带空格的命令都报 `Cannot find module '..."..."'` | `spawn` 加 `windowsVerbatimArguments` |
+
+测试从两套变三套，**66 项全绿**：
+
+```
+主回归      16/16
+下游补丁     8/8
+0.2.0 专项  45/45
+```
+
+其中几条是专门设计成「能反驳自己」的——比如断言旧 `listTasks({limit:500})` 写法在 601 条台账下**确实漏掉活动任务**，用来证明修的是真 bug。迁移那条用本机真实旧库（含 2.1 MB WAL）跑过：29 任务 / 53 事件 / 5 消息全保留。
 
 ---
 

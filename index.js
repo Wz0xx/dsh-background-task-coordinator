@@ -48,24 +48,115 @@ const PROMPT_TEXT = `## 后台任务
 
 const HOME_DATA = path.join(os.homedir(), '.dsh', 'background-task-coordinator');
 
-// 子进程在中文 Windows 上默认吐 GBK；先按 UTF-8 严格试一次，失败就认 GBK，认下就不再变。
+/**
+ * 台账库路径（0.2.0 按 profile 隔离）。
+ *
+ * 以前所有 profile 写同一个 `~/.dsh/background-task-coordinator/tasks.db`（审计 P2-7）：
+ * 开第二个 profile 时，它的启动对账查不到第一个 profile 内存里的 job/agent，
+ * 会把正在跑的任务**全部标 lost**——这是会真丢状态的串台。
+ *
+ * 现在路径是 `~/.dsh/background-task-coordinator/<profile>/tasks.db`：
+ *   - 有 DSH_PROFILE_DIR 用它（宿主给的真值，最准）；
+ *   - 否则用 DSH_PROFILE / DSH_PROFILE_NAME 的名字；
+ *   - 都没有（直接 node 跑测试）→ `default`。
+ * 旧库不自动搬：串台路径不清不楚，搬错比不搬更糟。要留老数据就手动 copy 到新目录。
+ */
+function dataDir() {
+  const raw = String(process.env.DSH_PROFILE_DIR ?? '').trim();
+  let tag = '';
+  if (raw) {
+    tag = path.basename(raw.replace(/[\\/]+$/, ''));
+  } else {
+    tag = String(process.env.DSH_PROFILE ?? process.env.DSH_PROFILE_NAME ?? '').trim();
+  }
+  // profile 名要当目录名用：去掉路径分隔符和 Windows 非法字符，其余原样保留。
+  tag = tag.replace(/[\\/:*?"<>|\u0000-\u001f]/g, '_').slice(0, 64) || 'default';
+  return path.join(HOME_DATA, tag);
+}
+
+function dbPath() {
+  return path.join(dataDir(), 'tasks.db');
+}
+
+// 子进程在中文 Windows 上默认吐 GBK。0.2.0 之前是「首个 chunk 试解一次就永久锁定编码」，
+// 而 Windows 命令的第一个 chunk 常常是纯 ASCII（比如 `echo` 之前什么都没打），
+// UTF-8 严格解码当然通过 → 锁成 utf8 → 之后所有 GBK 中文全成乱码（审计 P2-6）。
+//
+// 现在改成：
+//   - 每个编码用**单一持久 TextDecoder + { stream:true }**，多字节字符跨 chunk 也不会被劈成两半；
+//   - 纯 ASCII 的 chunk 直接按 UTF-8 吐（ASCII 在两种编码里字节一致，无损），
+//     但**不因此锁定**编码；
+//   - 只有第一次出现非 ASCII 字节时才判定：整段累积缓冲严格试 UTF-8，
+//     通过就 utf8，不通过就是 gbk。判定后把累积缓冲一次吐出去，之后直通。
+//   - end() 收尾，把解码器里可能残留的不完整序列冲出来（否则最后一行会缺字）。
 function makeChunkDecoder() {
-  let enc = null;
-  return (buf) => {
-    if (enc === null) {
-      try {
-        const s = new TextDecoder('utf-8', { fatal: true }).decode(buf);
-        enc = 'utf8';
-        return s;
-      } catch {
-        enc = 'gbk';
-        return new TextDecoder('gbk').decode(buf);
+  let enc = null;                                  // null = 还没判定
+  let dec = null;                                  // 判定后常驻的 TextDecoder
+  let pending = [];                                // 判定前的累积缓冲
+  let pendingLen = 0;
+
+  const openDecoder = (e) => (e === 'utf8'
+    ? new TextDecoder('utf-8')
+    : new TextDecoder('gbk'));
+
+  // 判定用：严格解一次累积缓冲。
+  // 返回 'utf8' | 'gbk' | null(null = 只是尾部被截了半个字符，等更多数据)。
+  const sniff = (buf) => {
+    try {
+      new TextDecoder('utf-8', { fatal: true }).decode(buf);
+      return 'utf8';
+    } catch {
+      // 可能是 UTF-8 多字节字符正好跨在 chunk 边界上：掐掉尾巴 1~3 字节再试。
+      for (let cut = 1; cut <= 3; cut++) {
+        if (buf.length <= cut) return null;
+        try {
+          new TextDecoder('utf-8', { fatal: true }).decode(buf.subarray(0, buf.length - cut));
+          return null;
+        } catch { /* 继续掐 */ }
       }
+      return 'gbk';
     }
-    return enc === 'utf8'
-      ? new TextDecoder('utf-8').decode(buf)
-      : new TextDecoder('gbk').decode(buf);
   };
+
+  const takeAll = () => {
+    if (!pending.length) return '';
+    const all = Buffer.concat(pending, pendingLen);
+    pending = [];
+    pendingLen = 0;
+    return all;
+  };
+
+  const decoder = (buf) => {
+    const b = Buffer.isBuffer(buf) ? buf : Buffer.from(buf);
+    if (dec) return dec.decode(b, { stream: true });
+
+    // 未判定：先看这段里有没有非 ASCII 字节。
+    // 纯 ASCII 段在多字节编码里必然自成整字（UTF-8 前导字节 ≥0xC0，GBK 前导 ≥0x81），
+    // 所以可以直接吐出去，不必进缓冲，也不会劈开后面的字符。
+    let hasHigh = false;
+    for (const byte of b) { if (byte >= 0x80) { hasHigh = true; break; } }
+    if (!hasHigh) return b.toString('utf8');
+
+    pending.push(b);
+    pendingLen += b.length;
+    const verdict = sniff(Buffer.concat(pending, pendingLen));
+    if (!verdict) return '';                       // 半截字符，等下一个 chunk
+    enc = verdict;
+    dec = openDecoder(enc);
+    return dec.decode(takeAll(), { stream: true });
+  };
+
+  // 收尾：把解码器内部缓冲冲干净。挂成属性而不是改签名，调用点可以少改一处。
+  decoder.end = () => {
+    if (dec) {
+      const tail = dec.decode();
+      return tail || '';
+    }
+    const rest = takeAll();
+    return rest.length ? rest.toString('utf8') : '';
+  };
+  decoder.encoding = () => enc;
+  return decoder;
 }
 
 // ---------------------------------------------------------------------------
@@ -83,7 +174,7 @@ let _log = () => {};
 
 function db() {
   if (!_sqlite) {
-    _sqlite = new CoordinatorDatabase(path.join(HOME_DATA, 'tasks.db'));
+    _sqlite = new CoordinatorDatabase(dbPath());
     migrateJsonFileIfNeeded();
   }
   return _sqlite;
@@ -91,7 +182,7 @@ function db() {
 
 /** 旧 tasks.json → SQLite 一次性迁移。 */
 function migrateJsonFileIfNeeded() {
-  const f = path.join(HOME_DATA, 'tasks.json');
+  const f = path.join(dataDir(), 'tasks.json');
   let raw;
   try {
     raw = JSON.parse(fs.readFileSync(f, 'utf8'));
@@ -261,9 +352,16 @@ function ownedBy(row, exec) {
 }
 
 function loadTasks() {
+  // 0.2.0：历史遗留的「拉全表投影」入口，已无调用点（工具路径全走 db() 直查）。
+  // 保留函数会误导后来人照抄 `limit: 500`，所以只留一个受限版本：
+  // 活动任务 + 最近 50 条终态，够调试看，不会因为任务累积而截断结算（审计 P1-4）。
   const d = db();
   const tasks = {};
-  for (const t of d.listTasks({ limit: 500 })) {
+  const rows = [
+    ...d.listActive([...ACTIVE]),
+    ...d.listTasks({ statuses: [...TERMINAL], limit: 50 }),
+  ];
+  for (const t of rows) {
     tasks[t.id] = {
       ...toTaskHandle(t),
       version: 1,
@@ -361,7 +459,11 @@ function probeJobs(ctx, injected) {
 // 插件主体
 // ---------------------------------------------------------------------------
 
-export function apply(ctx) {
+export function apply(ctx, config) {
+  // 插件配置（cordis.patch.yml 里 insert 的 config）。
+  // 0.2.0 之前 apply 根本不收第二个参数，所以 yml 里写什么都进不来 ——
+  // 那时候 config 是空对象所以看不出来，一旦往里加东西就成了假配置。
+  const PLUGIN_CFG = (config && typeof config === 'object') ? config : {};
   const logger = typeof ctx.logger?.info === 'function' ? ctx.logger : null;
   const log = (msg) => logger?.info?.(`[task-coordinator] ${msg}`);
   _log = log; // 模块级函数（migrate 等）也要能打日志
@@ -416,7 +518,9 @@ export function apply(ctx) {
   function sweepOnce(d) {
     let swept = 0;
     const now = Date.now();
-    for (const t of d.listTasks({ limit: 500 })) {
+    // 只扫活动 subagent（走 idx_tasks_status_created），不再拉全表前 500 条
+    // —— 任务累积到 500 条以上时，活动任务会掉出窗口，永远扫不到（审计 P1-4）。
+    for (const t of d.listActive([...ACTIVE])) {
       if (t.type !== 'subagent' || !ACTIVE.has(t.status)) continue;
 
       // 有 session id：按 id 探活。
@@ -504,8 +608,8 @@ export function apply(ctx) {
             };
           }
         } catch { /* 环境变量坏了用默认 */ }
-        // 活动任务只取活动态（不再拉全表 500 条内存过滤 —— 审计 P1-4）
-        const activeAll = d.listTasks({ statuses: [...ACTIVE], limit: 500 });
+        // 活动任务只取活动态（走 idx_tasks_status，不再拉全表 500 条内存过滤 —— 审计 P1-4）
+        const activeAll = d.listActive([...ACTIVE]);
         if (activeAll.length >= LIMITS.global) {
           return { ok: false, text: `已达全局活动任务上限（${activeAll.length}/${LIMITS.global}，DSH_COORD_LIMITS 可调）。等一个结束再建。（A11：不绕过限额启动）` };
         }
@@ -686,6 +790,14 @@ export function apply(ctx) {
                   shell: false,
                   windowsHide: true,
                   cwd,
+                  // Windows 上 cmd.exe /d /s /c 后面那一段必须原样交过去（0.2.0）。
+                  // 默认 Node 会按 CreateProcess 规则给每个参数加引号并转义内部引号，
+                  // 而 cmd 在 /s 下又会剥一层 —— 两头一夹，objective 里本来正常的
+                  // `node "C:\某目录\脚本.js"` 会被拼成字面引号：
+                  //   Cannot find module 'C:\...\"C:\某目录\脚本.js"'
+                  // 这不是测试构造的问题，是任何带引号、带空格的命令都会中招。
+                  // windowsVerbatimArguments 让 Node 不再转义，argv 原样进命令行。
+                  windowsVerbatimArguments: process.platform === 'win32',
                   // 非 Windows 上让子进程自成一个进程组，cancel 时才能整组杀干净；
                   // Windows 用 taskkill /T 走进程树，不需要这个。
                   detached: process.platform !== 'win32',
@@ -709,14 +821,14 @@ export function apply(ctx) {
                 };
                 if (child.stdout) {
                   child.stdout.on('data', (d2) => {
-                    job.append(decodeOut(d2), { channel: 'stdout' });
-                    bump();
+                    const s = decodeOut(d2);
+                    if (s) { job.append(s, { channel: 'stdout' }); bump(); }
                   });
                 }
                 if (child.stderr) {
                   child.stderr.on('data', (d2) => {
-                    job.append(decodeErr(d2), { channel: 'stderr' });
-                    bump();
+                    const s = decodeErr(d2);
+                    if (s) { job.append(s, { channel: 'stderr' }); bump(); }
                   });
                 }
                 return {
@@ -744,6 +856,14 @@ export function apply(ctx) {
                     // close 第二参是 signal：被信号杀掉时 code 为 null，光看 code 会误报
                     // 「exit null」。把 signal 一起写进 detail（审计 P1-2 ②）。
                     child.on('close', (code, signal) => {
+                      // 先冲解码器尾巴（不完整的多字节序列 / 判定前残留的缓冲），
+                      // 否则最后一行会缺字（审计 P2-6 的一部分）。
+                      for (const [dec, ch] of [[decodeOut, 'stdout'], [decodeErr, 'stderr']]) {
+                        try {
+                          const tail = dec.end?.();
+                          if (tail) job.append(tail, { channel: ch });
+                        } catch { /* 尾巴冲不出来就丢，不影响结算 */ }
+                      }
                       if (signal) {
                         resolve({ status: 'failed', detail: `killed by ${signal}` });
                         return;
@@ -809,9 +929,23 @@ export function apply(ctx) {
           const owner = t.ownerSessionId ? String(t.ownerSessionId) : null;
           return !owner || owner === caller;
         };
-        const all = d.listTasks({ limit: 500 }).filter(visible).sort((a, b) => b.createdAt - a.createdAt);
+        // 活动任务走 listActive（索引），终态按「最近 50 条」直接取窗口。
+        // 0.2.0 之前是 listTasks({limit:500}) + 内存过滤排序：任务超过 500 条后
+        // 活跃任务会掉出窗口，`task_list` 反而看不见在跑的东西（审计 P1-4）。
         const wantAll = Boolean(args?.all);
-        const rows = (wantAll ? all : all.filter((t) => ACTIVE.has(t.status))).slice(0, 50);
+        const pool = wantAll
+          ? d.listActive([...ACTIVE]).concat(d.listRecent(50))
+          : d.listActive([...ACTIVE]);
+        const seen = new Set();
+        const rows = [];
+        for (const t of pool) {
+          if (seen.has(t.id)) continue;
+          if (!visible(t)) continue;
+          if (!wantAll && !ACTIVE.has(t.status)) continue;
+          seen.add(t.id);
+          rows.push(t);
+          if (rows.length >= 50) break;
+        }
         if (!rows.length) return { ok: true, text: '（无任务）' };
         const lines = rows.map((t) =>
           `${t.id}  [${t.status}]  ${t.title}  (${t.type}${t.nativeId ? `/${t.nativeId}` : ''})  ${new Date(t.createdAt).toLocaleString()}`,
@@ -947,6 +1081,12 @@ export function apply(ctx) {
         const row = d.getTask(tid);
         if (!row) return { ok: false, text: `任务不存在：${args?.taskId}` };
         if (row.type !== 'subagent') return { ok: false, text: '只有 subagent 类型需要登记委派' };
+        // 终态不可逆（2026-11-27 审计 P1-5 ②）：以前对已 succeeded/failed/cancelled/lost
+        // 的任务再调一次，会把它直接改回 running，同时留着旧的 completed_at ——
+        // 台账从此自相矛盾（状态 running 但有完成时间），还会重新占住配额。
+        if (TERMINAL.has(row.status)) {
+          return { ok: false, text: `任务已终态（${row.status}），不能再登记委派。要续跑请新建任务。` };
+        }
         const agentName = String(args?.agentId ?? '').trim();
         if (!agentName) return { ok: false, text: 'agentId 不能为空（原生 subagent 工具返回的 agent 名）' };
         // 原生 subagent 工具只回 "started subagent <name>"，拿不到会话 id；
@@ -981,11 +1121,56 @@ export function apply(ctx) {
           `delegated → agent ${agentName}${realSid ? ` session ${realSid}` : '（session 未解析）'}`,
         );
         log(`委派登记：${tid} → agent ${agentName} session=${realSid ?? '未解析'}`);
+
+        // ---- 绑定后补投 pending 指令（0.2.0，审计 P1-5 ①）----
+        // 以前 task_append_message 在没绑定时落一条 pending 并承诺「绑定后补投」，
+        // 但这里根本没有 flush 逻辑 —— 消息永久卡在 pending，而且内容哈希幂等键
+        // 还会让用户重发同样的指令时被「已是 pending，未重复投递」挡回去。
+        // 现在绑定成功后立刻把 pending 全投一遍，投不出去的如实改成 undeliverable。
+        const flushLines = [];
+        let flushed = 0;
+        try {
+          const pend = d.listPendingMessages(tid);
+          if (pend.length) {
+            const ag = getAgentHandle(ctx, { nativeId: agentName, nativeSessionId: realSid ?? null });
+            for (const m of pend) {
+              if (!ag) {
+                // 绑定成功但 agent 还拿不到句柄（宿主注册表滞后 / 没有 agents 服务）：
+                // 别把 pending 改成失败，留着下一轮；但不假装投出去了。
+                flushLines.push(`  补投未完成：${m.messageId}（拿不到 agent 句柄，仍记为 pending）`);
+                continue;
+              }
+              try {
+                const message = {
+                  id: randomUUID(),
+                  role: 'user',
+                  content: [{ type: 'text', text: m.content }],
+                  source: { kind: 'user' },
+                };
+                if (typeof ag.followup === 'function') ag.followup(message);
+                else if (typeof ag.steer === 'function') ag.steer(message);
+                else throw new Error('这个 agent 没有 followup/steer');
+                d.updateMessage(m.messageId, { status: 'delivered', channel: 'agent-inbox-flush', deliveredAt: Date.now() });
+                emitEvent(null, tid, 'task.message_flushed', 'coordinator', `补投 ${m.messageId}`);
+                flushed += 1;
+              } catch (e) {
+                d.updateMessage(m.messageId, { status: 'undeliverable', reason: `补投失败: ${String(e).slice(0, 120)}` });
+                emitEvent(null, tid, 'task.message_failed', 'coordinator', `补投失败 ${m.messageId}`);
+                flushLines.push(`  补投失败：${m.messageId}（${String(e).slice(0, 80)}）`);
+              }
+            }
+            if (flushed) flushLines.unshift(`  已补投 ${flushed} 条绑定前排队的指令。`);
+          }
+        } catch (e) {
+          flushLines.push(`  补投过程出错（pending 保留）：${String(e).slice(0, 100)}`);
+        }
+
         const tail = realSid
           ? `已解析到会话 ${realSid}，结算会由 subagent/end 自动落账。`
           : '没能解析出会话 id（原生工具不返回、按名字反查也落空）：结算不靠事件，'
-            + '会在 task_list / task_describe 时按探活兜底落 lost；要确定状态请显式 task_cancel。';
-        return { ok: true, text: `已绑定：task ${tid} ↔ agent ${agentName}，任务进入 running。\n${tail}` };
+            + '会在 task_list 时按探活兜底落 lost；要确定状态请显式 task_cancel。';
+        const flushText = flushLines.length ? `\n${flushLines.join('\n')}` : '';
+        return { ok: true, text: `已绑定：task ${tid} ↔ agent ${agentName}，任务进入 running。\n${tail}${flushText}` };
       },
     }),
 
@@ -1027,11 +1212,29 @@ export function apply(ctx) {
         const t = toTaskHandle(row);
 
         // 幂等键去重（任务书表 7 / 11.1）：显式键或自动键（内容哈希）命中即不再投。
+        //
+        // 0.2.0 的判据变了（审计 P1-5 ① / P1-7）：
+        //   以前只要命中就挡，包括 pending 和 undeliverable ——
+        //   于是「绑定时排队的那条」和「上次没投出去的那条」会把后续重试永久锁死：
+        //   用户重发同样的指令、或绑定好之后再发一次，永远被回「已是 pending，未重复投递」。
+        //   只有 delivered / cancelled 才算真正发生过、不该再投；
+        //   pending / undeliverable 是「还没成」的状态，应该允许重试。
         const autoKey = `msg:${tid}:user:${fnv1a(content)}`;
         const checkKey = idem || autoKey;
-        const dup = d.listMessages(tid).find((m) => m.idempotencyKey === checkKey);
-        if (dup) {
-          return { ok: dup.status === 'delivered', text: `幂等命中：指令 ${dup.messageId} 已是 ${dup.status}，本次未重复投递。（idempotencyKey=${checkKey}）` };
+        const prior = d.listMessages(tid).filter((m) => m.idempotencyKey === checkKey);
+        const settled = prior.find((m) => m.status === 'delivered' || m.status === 'cancelled');
+        if (settled) {
+          return { ok: settled.status === 'delivered', text: `幂等命中：指令 ${settled.messageId} 已是 ${settled.status}，本次未重复投递。（idempotencyKey=${checkKey}）` };
+        }
+        // 没成的那条：这次要真投，就先把旧记录删掉。
+        // 为什么是删而不是改成 cancelled：幂等键在库里是 (task_id, key) 联合唯一，
+        // 同一 key 只允许一行 —— 留着旧的（哪怕状态已改）照样会撞索引，
+        // 结果是 INSERT 静默失败、消息投出去了但库里没记录（审计 P1-7 的形态）。
+        // 这些行从没投成功过，删掉不丢事实；投递尝试本身已经写在 task_events 里。
+        for (const m of prior) {
+          try {
+            d.deleteMessage(m.messageId);
+          } catch { /* 单条失败不阻塞本次投递 */ }
         }
 
         if (t.type === 'job') {
@@ -1356,7 +1559,7 @@ export function apply(ctx) {
     }),
   ];
 
-  log(`已注册 8 个工具（7 任务 + task_probe 诊断）；数据目录 ${HOME_DATA}`);
+  log(`已注册 8 个工具（7 任务 + task_probe 诊断）；数据目录 ${dataDir()}`);
 
   // -------------------------------------------------------------------------
   // 启动自检：能力三态报告（对照《DSH 插件跨版本兼容层开发任务书》§5.2 / §9）。
@@ -1445,7 +1648,7 @@ export function apply(ctx) {
   try {
     const d0 = db();
     let fixed = 0;
-    for (const t of d0.listTasks({ limit: 500 })) {
+    for (const t of d0.listActive([...ACTIVE])) {
       if (!ACTIVE.has(t.status)) continue;
       let alive = false;
       try {
@@ -1509,32 +1712,52 @@ export function apply(ctx) {
       const d = db();
       // 必须两个字段都比：nativeId 存 agent 名（人给的那半），nativeSessionId 存真会话 id（反查那半）。
       // 0.1.4 及以前只比 nativeId，事件到了也认不出 → 台账永远 running（2026-11-27 反馈 #2）。
-      const t = d.listTasks({ limit: 500 }).find(
-        (x) => x.nativeId === sid || (x.nativeSessionId != null && x.nativeSessionId === sid),
-      );
-      if (!t || !ACTIVE.has(t.status)) return;
+      //
+      // 0.2.0：改成走 idx_tasks_native_session 的定向查询（findActiveByNative），
+      // 不再拉全表前 500 条内存 .find()。原因有两层：
+      //   1. 任务累积超 500 条后，活动任务掉出窗口 → 事件到了也匹配不上，结算永久丢失（审计 P1-4）；
+      //   2. 旧写法会命中已终态的历史记录然后提前 return，漏掉真正活跃的那条。
+      const t = d.findActiveByNative(sid, [...ACTIVE], 'subagent');
+      if (!t) return;
       const raw = String(info?.stopReason ?? info?.status ?? info?.reason ?? info?.outcome ?? '');
       // A07 会合规则：cancel_requested 状态下收到原生结束事件，无论 stopReason 是什么
       // （常见 aborted/aborted:true，不含 cancel 字样），都落 cancelled——
       // 协调器自己请求过取消，结束就是确认，事实链完整。
       //
-      // 其余情况不能「不匹配失败就算成功」（深度审计 P2-2）：
-      // 0.1.7 及以前只认 cancel/fail/error/abort，其余一律 succeeded ——
-      // max_turns / timeout / interrupted / budget_exceeded / 空串 全都会落成「成功」，
-      // 那是假的。现在改成白名单：只有明确正常的结束词才判 succeeded，其余一律 failed
-      // 并把原始 stopReason 写进 errorSummary，让人能看出到底怎么停的。
-      const cancelled = t.status === 'cancel_requested' || /cancel|abort/i.test(raw);
-      // 明确表示「正常收尾」的 stopReason（不同宿主/版本用词不一，取常见集合）
+      // 其余情况按宿主**真实枚举**映射（0.2.0）。
+      // 本机 0.2.1-rc.4 的 asar 里 SubagentStopReasonMap 原文：
+      //   { completed:'completed', aborted:'aborted', error:'error',
+      //     'max-tokens':'max-tokens', refusal:'refusal' }
+      // 只有 completed 算正常收尾；aborted 是取消；error / max-tokens / refusal 都是失败。
+      //
+      // 0.1.7 之前的白名单只认 completed/end_turn/stop/success 那几个词，
+      // 而宿主实际不发那些词 —— 结果是 completed 被当成 unknown 落 failed（假失败）。
+      // 0.2.0 反过来：空 stopReason 也当「宿主没给原因」而不是失败，
+      // 只有明确在失败集合里的才落 failed，并且把原始词写进 errorSummary。
+      const cancelled = t.status === 'cancel_requested' || /^(aborted|cancel|canceled|cancelled)$/i.test(raw.trim());
+      // 明确「正常收尾」：completed（宿主枚举）+ 若干历史/其他版本用词
       const OK_REASONS = /^(completed|end_turn|stop|stop_sequence|success|succeeded|done)$/i;
-      const looksOk = OK_REASONS.test(raw.trim());
-      const failed = !cancelled && !looksOk;
+      // 明确「失败」：宿主枚举里的非正常终止词
+      const FAIL_REASONS = /^(error|max-tokens|max_tokens|max-turns|max_turns|timeout|refusal|budget[_]exceeded|context[_]length)$/i;
+      const trimmed = raw.trim();
+      // 空串 / 未知词 = 「宿主没给出可判定的原因」。这种不能算失败（那是编造事实），
+      // 也不能算成功（那也是编造）——落 succeeded 但把「未给出原因」写进 resultSummary，
+      // 让读的人知道这条结算的依据是「事件到了且没有报错」，不是「确认成功」。
+      const looksOk = OK_REASONS.test(trimmed);
+      const looksBad = FAIL_REASONS.test(trimmed);
+      const failed = !cancelled && looksBad;
       const status = cancelled ? 'cancelled' : failed ? 'failed' : 'succeeded';
+      const unknownReason = !cancelled && !looksOk && !looksBad;
       d.updateTaskFields(t.id, {
         status,
         currentStage: 'settled',
         // 失败的把原始 stopReason 留下来，别只说「失败了」
         errorSummary: failed ? `end: ${raw || '(空 stopReason)'}`.slice(0, 200) : (cancelled ? (t.errorSummary ?? '执行器确认停止') : undefined),
-        resultSummary: !failed && !cancelled ? '子代理已结束（原生 subagent/end）' : undefined,
+        resultSummary: cancelled ? undefined
+          : failed ? undefined
+            : unknownReason
+              ? `子代理已结束（原生 subagent/end；stopReason=${trimmed || '未给出'}，非失败词）`
+              : '子代理已结束（原生 subagent/end）',
         updatedAt: Date.now(),
         completedAt: Date.now(),
       });
@@ -1559,7 +1782,9 @@ export function apply(ctx) {
         const st = String(ev.job?.status ?? '');
         const detail = ev.job?.detail;
         const d = db();
-        const t = d.listTasks({ limit: 500 }).find((x) => x.nativeId === String(jobId));
+        // 同样走索引定向查询（0.2.0）：只按 nativeId 找活动 job，
+        // 不再拉全表 500 条 —— 超窗口后结算事件会被永久丢弃（审计 P1-4）。
+        const t = d.findActiveByNative(String(jobId), [...ACTIVE], 'job');
         if (!t || !ACTIVE.has(t.status)) return;
         const terminal =
           st === 'completed' ? 'succeeded' :
@@ -1593,20 +1818,46 @@ export function apply(ctx) {
   // 5 分钟一扫，不做高精度定时——任务书要的是「超时先请求取消，等待确认后落终态」。
   // -------------------------------------------------------------------------
   const LIMITS_READ = () => {
-    let lim = { timeoutMinutes: 120, sweepSeconds: 300 };
+    // 三层来源，后者盖前者：内置默认 → cordis.patch.yml 的 config → DSH_COORD_LIMITS 环境变量。
+    // 环境变量放最后是为了「临时调大试试」不用改 yml 重启。
+    let lim = {
+      timeoutMinutes: 120,
+      sweepSeconds: 300,
+      retentionDays: 30,
+      ...(PLUGIN_CFG && typeof PLUGIN_CFG === 'object' ? PLUGIN_CFG : {}),
+    };
     try {
       const raw = process.env.DSH_COORD_LIMITS;
       if (raw) lim = { ...lim, ...JSON.parse(raw) };
-    } catch { /* 用默认 */ }
-    return lim;
+    } catch { /* 环境变量坏了用上一层 */ }
+    // 数值必须落地成有限数（审计 P2-8 的同一类问题）：
+    // yml 里写了 "300"（字符串）或写错字段名，Math.max(1, NaN) 还是 NaN，
+    // setInterval(NaN) 会退化成 1ms 死循环 —— 那比不设还糟。
+    const num = (v, def, min) => {
+      const n = Number(v);
+      return Number.isFinite(n) && n >= min ? n : def;
+    };
+    return {
+      timeoutMinutes: num(lim.timeoutMinutes, 120, 1),
+      sweepSeconds: num(lim.sweepSeconds, 300, 1),
+      retentionDays: num(lim.retentionDays, 30, 0),
+    };
   };
+  // -------------------------------------------------------------------------
+  // 维护循环（0.2.0）：超时清账 + 历史清理。
+  //
+  // 以前这里只做过期取消，`purgeHistoryOlderThan()` 定义了却**从没被调用**（审计 P1-4）：
+  // 台账与幂等表只增不减，跑到 500 条之后结算就开始丢。
+  // 现在同一个定时器里两件事都做：先清超时，再清历史。
+  //
+  // 保留天数用 DSH_COORD_LIMITS.retentionDays 调（默认 30 天），到 0 表示不清。
+  // -------------------------------------------------------------------------
   const sweepTimer = setInterval(() => {
     try {
       const d = db();
       const now = Date.now();
       let changed = 0;
-      for (const t of d.listTasks({ limit: 500 })) {
-        if (!ACTIVE.has(t.status)) continue;
+      for (const t of d.listActive([...ACTIVE])) {
         // deadline 落在 labels.deadlineAt（建任务时写入）
         const dl = Number(t.labels?.deadlineAt ?? 0);
         if (!dl || now <= dl) continue;
@@ -1655,6 +1906,23 @@ export function apply(ctx) {
       if (changed) {
         log(`超时清账：${changed} 条任务过 deadline，已请求取消`);
       }
+
+      // ---- 历史清理（0.2.0，审计 P1-4）----
+      // 只清「终态 + 完成超过 retentionDays」的：活动任务一条不动。
+      // retentionDays <= 0 视为关掉清理（有人要长期留证据）。
+      // 清理失败只记日志，绝不能因此跳过下一轮超时扫描。
+      try {
+        const days = Number(LIMITS_READ().retentionDays);
+        if (Number.isFinite(days) && days > 0) {
+          const cutoff = now - days * 24 * 60 * 60 * 1000;
+          const purged = d.purgeHistoryOlderThan(cutoff);
+          if (purged.tasks || purged.events || purged.idempotency) {
+            log(`历史清理：删任务 ${purged.tasks} 条、事件 ${purged.events} 条、幂等账 ${purged.idempotency} 条（早于 ${days} 天）`);
+          }
+        }
+      } catch (e) {
+        log(`历史清理失败（不阻塞）：${String(e).slice(0, 120)}`);
+      }
     } catch (e) {
       log(`超时清账失败（不阻塞）：${String(e).slice(0, 120)}`);
     }
@@ -1668,6 +1936,19 @@ export function apply(ctx) {
       try {
         d?.();
       } catch { /* 清理失败不影响卸载 */ }
+    }
+    // 0.2.0：卸载时把库关掉（审计 P2-7）。
+    // 以前 dispose() 只摘订阅和定时器，_sqlite 一直攥着句柄：
+    // 插件重载会累积连接、-wal 永不 checkpoint、Windows 上库文件还被锁住。
+    try {
+      if (_sqlite) {
+        _sqlite.close();
+        log('台账已关闭（dispose）');
+      }
+    } catch (e) {
+      log(`关库失败（不阻塞卸载）：${String(e).slice(0, 120)}`);
+    } finally {
+      _sqlite = null;
     }
   };
 }
