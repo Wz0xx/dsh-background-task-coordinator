@@ -16,7 +16,7 @@ DSH 本身就能起后台作业和子代理。但没有一个统一的账本—�
 - **一个地方查**：阶段、进度、结果摘要
 - **中途改要求**：追加指令真能送到，送不到就如实说送不到
 - **结束/失败有通知**：不用盯着查
-- **重启不撒谎**：原生执行单元没了的任务标 `interrupted`，绝不虚报 running
+- **重启不撒谎**：原生执行单元没了的任务标 `lost`，绝不虚报 running
 - **真并行**：多个任务同时跑，不是排队
 
 ---
@@ -175,6 +175,28 @@ background jobs unavailable: no job controller serves this agent
 
 - `ctx.jobs 探测：[{"key":"jobs","methods":[]}]`——`methods` 是空的但 `jobs.start()` 调得通。这个服务是受控代理，反射拿不到方法名。**别拿 `methods: []` 判断「服务没挂」。**
 - `followup` / `steer` 收的是**消息对象**不是字符串。传裸字符串会抛 `Cannot read properties of undefined (reading 'kind')`，把子代理整轮打成 error。
+
+---
+
+## 八点五、启动自检与能力检测
+
+启动时打一行 `compat:`，列出本机每项能力的三态（`supported` / `unsupported`），拿不到就是 `unsupported`，不猜：
+
+```
+[task-coordinator] compat: {"overallStatus":"degraded","caps":{
+  "job.start":"supported","job.inspect":"supported","job.cancel":"supported",
+  "agent.get":"supported","subagent.resolve_name":"unsupported",
+  "subagent.list_children":"supported", ...}}
+```
+
+**`subagent.resolve_name`** 在 0.2.1-rc.4 上是 `unsupported`（该版本的 asar 里没有 `resolveName`，只有 `listChildren`）。插件按双路降级：
+
+| 宿主版本 | 名字→会话 id 怎么解析 |
+|---|---|
+| 0.2.2+ | `ctx.subagents.resolveName(caller, name)` |
+| 0.2.1 | `ctx.subagents.listChildren(parentSessionId)` → 按 `label` 匹配 |
+
+两条都拿不到时，`nativeSessionId` 留 `null`（**绝不把 agent 名字当会话 id 落库**），`task_register_delegation` 的返回文本会明说「结算靠兜底」；这种任务的终态改由 `task_list` 探活兜底落 `lost`。
 
 ---
 

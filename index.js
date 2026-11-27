@@ -17,6 +17,11 @@ import path from 'node:path';
 import os from 'node:os';
 import { spawn, execSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
+import {
+  resolveSubagentSessionId,
+  probeSubagentCapabilities,
+  getAgentHandle,
+} from './compat/subagents-adapter.js';
 
 export const inject = ['tools', 'jobs', 'agents', 'systemPrompt'];
 /**
@@ -544,6 +549,26 @@ export function apply(ctx) {
       output: textOut(),
       async execute(args) {
         const d = db();
+        // 兜底探活（2026-11-27 反馈 #2 的 P1 项）：subagent/end 事件可能因为
+        // 名字->id 没解析出来而认不出任务。这里在列任务时顺手扫一遍活动中的 subagent：
+        // 只对「已经有 nativeSessionId」的行动手（有 id 才能探活），
+        // 查不到 agent = 原生已回收但没收到事件 → 补落 lost。解析不出 id 的一律不动。
+        let swept = 0;
+        for (const t of d.listTasks({ limit: 500 })) {
+          if (t.type !== 'subagent' || !ACTIVE.has(t.status) || !t.nativeSessionId) continue;
+          if (getAgentHandle(ctx, t)) continue;
+          d.updateTaskFields(t.id, {
+            status: 'lost',
+            currentStage: 'reconciled',
+            errorSummary: '探活兜底：原生 subagent 已回收，但没收到 subagent/end',
+            updatedAt: Date.now(),
+            completedAt: Date.now(),
+          });
+          emitEvent(null, t.id, 'task.lost', 'reconciler', '探活兜底');
+          settleNotification(null, { id: t.id, status: 'lost' });
+          swept += 1;
+        }
+        if (swept) log(`探活兜底：${swept} 条 subagent 任务原生已回收，补落 lost`);
         const all = d.listTasks({ limit: 500 }).sort((a, b) => b.createdAt - a.createdAt);
         const wantAll = Boolean(args?.all);
         const rows = (wantAll ? all : all.filter((t) => ACTIVE.has(t.status))).slice(0, 50);
@@ -551,6 +576,7 @@ export function apply(ctx) {
         const lines = rows.map((t) =>
           `${t.id}  [${t.status}]  ${t.title}  (${t.type}${t.nativeId ? `/${t.nativeId}` : ''})  ${new Date(t.createdAt).toLocaleString()}`,
         );
+        if (swept) lines.unshift(`（本轮探活补落 ${swept} 条 lost）`);
         return { ok: true, text: lines.join('\n') };
       },
     }),
@@ -595,9 +621,9 @@ export function apply(ctx) {
         ];
 
         // subagent：真源在 DSH，台账只是投影 —— 这里每次现查一次原生 agent。
-        if (t.type === 'subagent' && t.nativeId) {
+        if (t.type === 'subagent' && (t.nativeSessionId || t.nativeId)) {
           try {
-            const ag = ctx.agents?.get?.(t.nativeId);
+            const ag = getAgentHandle(ctx, t);
             if (!ag) {
               lines.push('原生 agent：查不到（可能已结束回收）');
             } else {
@@ -674,25 +700,45 @@ export function apply(ctx) {
         },
       },
       output: textOut(),
-      async execute(args) {
+      async execute(args, exec) {
         const d = db();
         const tid = String(args?.taskId ?? '');
         const row = d.getTask(tid);
         if (!row) return { ok: false, text: `任务不存在：${args?.taskId}` };
         if (row.type !== 'subagent') return { ok: false, text: '只有 subagent 类型需要登记委派' };
+        const agentName = String(args?.agentId ?? '').trim();
+        if (!agentName) return { ok: false, text: 'agentId 不能为空（原生 subagent 工具返回的 agent 名）' };
+        // 原生 subagent 工具只回 "started subagent <name>"，拿不到会话 id；
+        // 结算事件 subagent/end 只带会话 id。两边要接上，必须在这里把名字换成 id：
+        //   0.2.2+ resolveName(caller, name) → SessionId
+        //   0.2.1  listChildren(parentSessionId) → 按 label 匹配
+        // 反查不出来就留 null（绝不把名字当 id 落库），并在返回文本里说清楚结算靠兜底。
+        const realSid = await resolveSubagentSessionId(
+          ctx,
+          agentName,
+          exec?.agent,
+          String(args?.sessionId ?? ''),
+        );
         // queued → starting → running（V1.1 表 3：不再直达）
         const from = row.status;
         if (from === 'queued') d.updateTaskFields(tid, { status: 'starting', updatedAt: Date.now() });
         d.updateTaskFields(tid, {
           status: 'running',
-          nativeId: String(args?.agentId ?? ''),
-          nativeSessionId: String(args?.sessionId ?? ''),
+          nativeId: agentName,
+          nativeSessionId: realSid ?? null,
           currentStage: 'delegated',
           updatedAt: Date.now(),
         });
-        emitEvent(null, tid, 'task.started', 'coordinator', `delegated → agent ${args?.agentId}`);
-        log(`委派登记：${tid} → agent ${args?.agentId}`);
-        return { ok: true, text: `已绑定：task ${tid} ↔ agent ${args?.agentId}，任务进入 running。` };
+        emitEvent(
+          null, tid, 'task.started', 'coordinator',
+          `delegated → agent ${agentName}${realSid ? ` session ${realSid}` : '（session 未解析）'}`,
+        );
+        log(`委派登记：${tid} → agent ${agentName} session=${realSid ?? '未解析'}`);
+        const tail = realSid
+          ? `已解析到会话 ${realSid}，结算会由 subagent/end 自动落账。`
+          : '没能解析出会话 id（原生工具不返回、按名字反查也落空）：结算不靠事件，'
+            + '会在 task_list / task_describe 时按探活兜底落 lost；要确定状态请显式 task_cancel。';
+        return { ok: true, text: `已绑定：task ${tid} ↔ agent ${agentName}，任务进入 running。\n${tail}` };
       },
     }),
 
@@ -767,12 +813,9 @@ export function apply(ctx) {
           return { ok: false, text: '任务尚未绑定 subagent（先 task_register_delegation）。指令已登记为 pending，绑定后补投。' };
         }
         // 真实投递：ctx.agents.get(sessionId) 拿活着的 agent，调 followup / steer。
-        // 契约来自 cordis inspect → host/Service → agents.get(id: SessionId): Agent | undefined
-        // 与 ReactLoopAgent.followup(input) / steer(input)。
-        // 查不到只有一个原因：这个 agent 已经结束回收 —— 那就不装作投出去了。
-        const ag = (() => {
-          try { return ctx.agents?.get?.(t.nativeId); } catch { return undefined; }
-        })();
+        // ctx.agents 只按 session id 索引 —— 台账里 nativeId 是 agent 名，必须用 nativeSessionId
+        // （没解析出才退回名字，会查不到，那就是如实报不可达，不装作投出去了）。
+        const ag = getAgentHandle(ctx, t);
         if (!ag) {
           d.insertMessage({
             messageId: mid,
@@ -1008,6 +1051,52 @@ export function apply(ctx) {
   log(`已注册 8 个工具（7 任务 + task_probe 诊断）；数据目录 ${HOME_DATA}`);
 
   // -------------------------------------------------------------------------
+  // 启动自检：能力三态报告（对照《DSH 插件跨版本兼容层开发任务书》§5.2 / §9）。
+  // 只做反射检测，不起真实任务、不发消息（任务书 §16）。
+  // subagent.resolve_name 是 0.2.2 才有的：本机 0.2.1-rc.4 上是 unsupported，
+  // 那条路走 list_children 降级 —— 报告里写清楚，省得下次再猜。
+  // -------------------------------------------------------------------------
+  let compatReport = null;
+  try {
+    const subCaps = probeSubagentCapabilities(ctx);
+    const caps = {
+      'job.start': typeof ctx.jobs?.start === 'function' ? 'supported' : 'unsupported',
+      'job.inspect': typeof ctx.jobs?.get === 'function' && typeof ctx.jobs?.readAt === 'function' ? 'supported' : 'unsupported',
+      'job.cancel': typeof ctx.jobs?.kill === 'function' ? 'supported' : 'unsupported',
+      'job.settle_event': typeof ctx.jobs?.events?.subscribe === 'function' ? 'supported' : 'unsupported',
+      'job.activity_event': typeof ctx.on === 'function' ? 'supported' : 'unsupported',
+      'agent.get': typeof ctx.agents?.get === 'function' ? 'supported' : 'unsupported',
+      'subagent.resolve_name': subCaps.resolveName,
+      'subagent.list_children': subCaps.listChildren,
+      'sandbox.confine': typeof ctx.sandbox?.confine === 'function' ? 'supported' : 'unsupported',
+      'sandbox.policy': typeof ctx.sandboxPolicy?.resolve === 'function' ? 'supported' : 'unsupported',
+      'working_directory': typeof ctx.workingDirectory?.ensure === 'function' ? 'supported' : 'unsupported',
+      'system_prompt.section': typeof ctx.systemPrompt?.section === 'function' ? 'supported' : 'unsupported',
+    };
+    // 必需能力：缺哪个插件就得降级/不可用（任务书 §9 判定）
+    const required = ['job.start', 'job.inspect', 'job.cancel', 'agent.get'];
+    const missingRequired = required.filter((k) => caps[k] !== 'supported');
+    // subagent 结算至少要有一条反查路，否则 subagent 任务无法自动落账
+    const settlePath = (caps['subagent.resolve_name'] === 'supported' || caps['subagent.list_children'] === 'supported')
+      ? 'supported' : 'unsupported';
+    caps['subagent.settle_resolve'] = settlePath;
+    const degraded = Object.entries(caps).filter(([, v]) => v !== 'supported').map(([k]) => k);
+    compatReport = {
+      overallStatus: missingRequired.length ? 'incompatible' : degraded.length ? 'degraded' : 'compatible',
+      missingRequired,
+      degraded,
+      caps,
+    };
+    // 日志直接序列化对象本身，避免手写字段名和对象字段名对不上（overallStatus vs status）。
+    log(`compat: ${JSON.stringify(compatReport)}`);
+    if (missingRequired.length) {
+      log(`compat 警告：必需能力缺失（${missingRequired.join('、')}），job 类型的任务将无法创建；subagent 类型仍可用。`);
+    }
+  } catch (e) {
+    log(`compat 检测失败（不阻塞）：${String(e).slice(0, 160)}`);
+  }
+
+  // -------------------------------------------------------------------------
   // 启动对账（任务书 5.4）：台账里的 running 只是投影，真源在 DSH。
   // 插件重新加载 / 宿主重启后，先问一遍原生：还在不在。查不到的标 lost，
   // 绝不把数据库里的 running 当成事实。
@@ -1023,8 +1112,10 @@ export function apply(ctx) {
           // caller 用台账 owner_session_id（assertAccess 围栏：查别人的有主 job 会抛错）。
           const v = ctx.jobs?.get?.(t.nativeId, t.ownerSessionId ?? undefined);
           alive = !!v && (v.status === 'running' || v.status === 'stopping');
-        } else if (t.type === 'subagent' && t.nativeId) {
-          alive = !!ctx.agents?.get?.(t.nativeId);
+        } else if (t.type === 'subagent' && (t.nativeSessionId || t.nativeId)) {
+          // 只认 session id：反查出 id 的按 id 探活；没解析出的（nativeSessionId=null）
+          // 拿名字探必然查不到 —— 那种情况不该判 lost（是不知道，不是死了），留给兜底与显式取消。
+          alive = t.nativeSessionId ? !!getAgentHandle(ctx, t) : true;
         } else {
           alive = false;
         }
@@ -1062,10 +1153,17 @@ export function apply(ctx) {
   try {
     const offEnd = ctx.on('subagent/end', (info) => {
       log(`subagent/end：${JSON.stringify(info).slice(0, 400)}`);
+      // SubagentRunEndInfo 原文只带 { runId, provider, id: SessionId, local, stopReason }：
+      // 没有 sessionId / agentId / childId。前三个兜底恒 undefined，最终落 info.id。
       const id = info?.sessionId ?? info?.childId ?? info?.agentId ?? info?.id;
       if (!id) return;
+      const sid = String(id);
       const d = db();
-      const t = d.listTasks({ limit: 500 }).find((x) => x.nativeId === String(id));
+      // 必须两个字段都比：nativeId 存 agent 名（人给的那半），nativeSessionId 存真会话 id（反查那半）。
+      // 0.1.4 及以前只比 nativeId，事件到了也认不出 → 台账永远 running（2026-11-27 反馈 #2）。
+      const t = d.listTasks({ limit: 500 }).find(
+        (x) => x.nativeId === sid || (x.nativeSessionId != null && x.nativeSessionId === sid),
+      );
       if (!t || !ACTIVE.has(t.status)) return;
       const raw = String(info?.stopReason ?? info?.status ?? info?.reason ?? info?.outcome ?? '');
       // A07 会合规则：cancel_requested 状态下收到原生结束事件，无论 stopReason 是什么

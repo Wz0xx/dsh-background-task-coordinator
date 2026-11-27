@@ -11,3 +11,14 @@ dist/
 *.tgz
 *.zip
 .DS_Store
+
+# 编译产物只跟踪运行时要用的 .js；类型声明与 source map 不进仓库
+*.d.ts
+*.d.ts.map
+*.js.map
+lib/core/
+lib/adapters/
+lib/communication/
+lib/context/
+lib/integrations/
+lib/resources/
