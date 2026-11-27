@@ -95,12 +95,26 @@ export function probeSubagentCapabilities(ctx) {
  * @param {object} ctx
  * @param {{nativeSessionId?: string|null, nativeId?: string|null}} task
  */
+/**
+ * 取 agent handle。
+ *
+ * 返回三态（2026-11-27 下游补丁反馈「顺带 1」）：
+ *   - agent 对象：查到了
+ *   - undefined：确实查不到（agent 已回收）—— 这是**结论**
+ *   - 抛错不再吞：调用方要能区分「查不到」和「查询本身失败」
+ *
+ * 早期把异常吞成 undefined，导致 index.js 里「探不动就别下结论」那层 try/catch
+ * 成了死代码 —— 查出错和查不到被混成同一件事，会误判死活。
+ */
 export function getAgentHandle(ctx, task) {
   const sid = task?.nativeSessionId || task?.nativeId;
   if (!sid) return undefined;
-  try {
-    return ctx?.agents?.get?.(sid);
-  } catch {
-    return undefined;
-  }
+  // 只让「服务取不到」退化为 undefined；get 本身抛错就让它冒出去，
+  // 调用方据此判断「这次探活没做成」（而不是「agent 没了」）。
+  const agents = (() => {
+    try { return typeof ctx?.get === 'function' ? ctx.get('agents') : ctx?.agents; }
+    catch { return undefined; }
+  })();
+  if (!agents || typeof agents.get !== 'function') return undefined;
+  return agents.get(sid);
 }

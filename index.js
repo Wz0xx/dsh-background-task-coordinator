@@ -405,11 +405,13 @@ export function apply(ctx) {
   /**
    * 兜底探活（一次扫描）：把「原生已回收但没收到 subagent/end」的活动 subagent 任务补落 lost。
    *
-   * 只对带 nativeSessionId 的行动手（有 id 才探得动）；解析不出 id 的一律不动 ——
-   * 那是「不知道」，不是「死了」。返回本轮补落的条数。
+   * 只对带 nativeSessionId 的行动手（有 id 才探得动）；解析不出 id 的走宽限期，
+   * 超时未绑定才收 —— 那是「不知道」，不是「死了」，不能立刻判死。
+   * 返回本轮补落的条数。
    *
-   * task_list 与 task_describe 都调它（2026-11-27 反馈 §3：
-   * 文档写了两处都触发，代码原来只有 task_list，两头不靠）。
+   * **只有 `task_list` 调它**。`task_describe` 在 0.1.7 之后不再调
+   * （当时它会让只读工具写终态，审计 A1 已改回只读）。
+   * 别照旧注释把 describe 那条接回来。
    */
   function sweepOnce(d) {
     let swept = 0;
@@ -487,14 +489,17 @@ export function apply(ctx) {
           const n = Number(v);
           return Number.isFinite(n) && n >= min ? n : def;
         };
-        let LIMITS = { global: 3, perOwner: 2, timeoutMinutes: 120 };
+        // 默认值取中间档 5/4（2026-11-27 下游补丁反馈 §1）：
+        // 原来的 3/2 对「几个目录同时扫 + 构建和测试分头跑」这种天然并行的活偏紧，
+        // 撞限之后只能串行，等于回到没用插件之前。重度用户可以用 DSH_COORD_LIMITS 调更大。
+        let LIMITS = { global: 5, perOwner: 4, timeoutMinutes: 120 };
         try {
           const raw = process.env.DSH_COORD_LIMITS;
           if (raw) {
             const j = JSON.parse(raw);
             LIMITS = {
-              global: num(j?.global, 3, 1),
-              perOwner: num(j?.perOwner, 2, 1),
+              global: num(j?.global, 5, 1),
+              perOwner: num(j?.perOwner, 4, 1),
               timeoutMinutes: num(j?.timeoutMinutes, 120, 1),
             };
           }
@@ -570,19 +575,44 @@ export function apply(ctx) {
           };
           let cwd = null;
           let cwdErr = null;
+          let cwdFallback = false;
           try {
-            const ag = exec?.agent ?? null;
+            // 四级兜底（2026-11-27 下游补丁反馈 §2）：
+            // 在 0.2.2-rc.3 上 exec.agent 经常为空（同一条会话里时有时无），
+            // 只试 exec.agent 会让同一句「帮我跑个构建」有时能建、有时拒建 ——
+            // 对使用者就是随机失败。所以退到「能拿到就用，拿不到就标记着用进程目录」。
             const wd = svc('workingDirectory');
-            if (ag && wd && typeof wd.ensure === 'function') cwd = await wd.ensure(ag, undefined) ?? null;
+            // 第一级：调用上下文里的 agent
+            // 第二级：按台账 ownerSessionId 从 agents 注册表捞
+            const ag = exec?.agent ?? (ownerSessionId ? svc('agents')?.get?.(ownerSessionId) : null) ?? null;
+            if (ag && wd && typeof wd.ensure === 'function') {
+              cwd = await wd.ensure(ag, undefined) ?? null;
+            }
+            // 第三级：会话头里的 cwd（可能没有 sessions 服务，取不到就算了）
+            if (!cwd && ownerSessionId) {
+              const sessions = svc('sessions');
+              const h = sessions?.get?.(ownerSessionId)?.header;
+              if (typeof h?.cwd === 'string' && h.cwd) cwd = h.cwd;
+            }
           } catch (e) { cwdErr = e; }
           if (!cwd) {
-            // 把「为什么」写进文案，别只说「拿不到」（报告 4.4）：
-            // 下一个人一眼能看到真正原因，不用去猜宿主管不管。
-            const why = cwdErr?.message
-              ? String(cwdErr.message).slice(0, 160)
-              : 'workingDirectory 服务不可用或未绑定工作目录';
-            d.updateTaskFields(id, { status: 'failed', errorSummary: `working directory unavailable: ${why}`, updatedAt: Date.now(), completedAt: Date.now() });
-            return { ok: false, text: `建任务失败：拿不到本会话的工作目录（cwd）——原因：${why}。（taskId=${id}）` };
+            // 第四级：退回宿主进程目录，但**打标记**，不假装拿到了会话目录。
+            // 宁可跑在进程目录并标注，也不要随机拒建（反馈原话）。
+            cwd = process.cwd();
+            cwdFallback = true;
+            log(`建任务 ${id}：拿不到会话 cwd${cwdErr ? `（${String(cwdErr.message).slice(0, 120)}）` : ''}，退回宿主进程目录 ${cwd}（cwdFallback=true）`);
+          }
+          // 落账：cwd 与是否退回过进程目录都要记下来，事后能分辨「这条任务跑在哪儿」。
+          {
+            const cur = d.getTask(id);
+            d.updateTaskFields(id, {
+              labels: {
+                ...(cur?.labels ?? {}),
+                cwd: String(cwd),
+                ...(cwdFallback ? { cwdFallback: 'true' } : {}),
+              },
+              updatedAt: Date.now(),
+            });
           }
           const wrapped = process.platform === 'win32'
             ? ['cmd.exe', '/d', '/s', '/c', firstLine]
@@ -592,15 +622,27 @@ export function apply(ctx) {
           // 取服务同样必须走 ctx.get()（同一原因：直取会抛 `without inject`）。
           let argv = null;
           try {
-            const ag = exec?.agent ?? null;
+            // agent 兜底与 cwd 段一致：exec.agent 常为空，退到台账 ownerSessionId 捞。
+            const ag = exec?.agent
+              ?? (ownerSessionId ? svc('agents')?.get?.(ownerSessionId) : null)
+              ?? null;
             const sbp = svc('sandboxPolicy');
             const sb = svc('sandbox');
-            const policy = (ag && sbp && typeof sbp.resolve === 'function')
-              ? await sbp.resolve({ session: ag.session })
+            // sandboxPolicy.resolve(request = {}) 的 session 是**可选**的：
+            // 宿主实现里「没有 session 就退回部署默认模式」
+            // （原文注释：the configured root is the fallback for agentless calls
+            //   and sessions without a cwd）。
+            // 所以这里不能因为拿不到 agent 就拒建 —— 那正是「同一句话有时能建、
+            // 有时拒建」的随机失败来源（2026-11-27 下游补丁反馈 §2）。
+            const policy = (sbp && typeof sbp.resolve === 'function')
+              ? await sbp.resolve(ag ? { session: ag.session } : {})
               : null;
             if (!policy) {
-              d.updateTaskFields(id, { status: 'failed', errorSummary: 'sandbox 策略不可解析', updatedAt: Date.now(), completedAt: Date.now() });
-              return { ok: false, text: `建任务失败：拿不到本会话的沙箱策略（sandboxPolicy 服务不可用，或无返回），拒绝无沙箱执行。（taskId=${id}）` };
+              const why = !sbp
+                ? 'sandboxPolicy 服务不可用'
+                : 'sandboxPolicy.resolve 无返回';
+              d.updateTaskFields(id, { status: 'failed', errorSummary: `sandbox 策略不可解析: ${why}`, updatedAt: Date.now(), completedAt: Date.now() });
+              return { ok: false, text: `建任务失败：拿不到本会话的沙箱策略（${why}），拒绝无沙箱执行。（taskId=${id}）` };
             }
             if (policy.mode === 'danger-full-access') {
               // 显式放行：直接用原始 argv，这是宿主明确允许的
@@ -618,8 +660,17 @@ export function apply(ctx) {
               argv = sandboxed.argv.map(String);
             }
           } catch (e) {
-            d.updateTaskFields(id, { status: 'failed', errorSummary: `sandbox 拒绝: ${String(e).slice(0, 120)}`, updatedAt: Date.now(), completedAt: Date.now() });
-            return { ok: false, text: `建任务失败：sandbox 拒绝（${String(e).slice(0, 120)}）——当前会话沙箱策略不允许自由 shell。（taskId=${id}）` };
+            // 区分两类错误（2026-11-27 下游补丁反馈 §3）：
+            //   「插件拿不到服务」和「宿主不许这个会话跑」对用户意义完全不同，
+            //   混成一句「沙箱拒绝」会让人以为是自己的会话有问题。
+            const msg = String(e?.message ?? e);
+            const unavailable = /without inject|not registered|unknown service|is not a function/i.test(msg);
+            const label = unavailable ? 'sandbox 服务不可用' : 'sandbox 拒绝';
+            d.updateTaskFields(id, { status: 'failed', errorSummary: `${label}: ${msg.slice(0, 160)}`, updatedAt: Date.now(), completedAt: Date.now() });
+            const hint = unavailable
+              ? '插件侧拿不到 sandbox 服务（不是你的会话有问题）'
+              : '当前会话沙箱策略不允许自由 shell';
+            return { ok: false, text: `建任务失败：${label}（${msg.slice(0, 160)}）——${hint}。（taskId=${id}）` };
           }
           try {
           const jobId = registry.start({
@@ -1114,15 +1165,24 @@ export function apply(ctx) {
             ctx.jobs.kill(t.nativeId, killCaller, reason);
             nativeOk = 'killed';
           } else if (t.type === 'subagent') {
-            // 真的去中断它，不是只写一句字符串（审计 P1-3）：
-            // 0.1.7 这里只赋了个 'interrupt-requested(经模型工具)'，模型看到
-            // 「已请求取消」就不会再动手，子代理照常跑完并产生全部副作用。
-            const ag = getAgentHandle(ctx, t);
+            // 真的去中断它，不是只写一句字符串（审计 P1-3）。
+            //
+            // 判据必须是「有真 session id 才探活」（2026-11-27 下游补丁反馈 §4 的坑）：
+            // getAgentHandle 内部是 `nativeSessionId || nativeId`，nativeSessionId 为 null 时
+            // 会拿 **agent 名字**去查按 session id 索引的注册表 → 恒空 →
+            // 把还活着的 subagent 判成已回收、直接落 cancelled。那是误杀。
+            const hasRealId = !!t.nativeSessionId;
+            const ag = hasRealId ? getAgentHandle(ctx, t) : undefined;
             if (ag && typeof ag.cancel === 'function') {
               ag.cancel({ kind: 'user' }, { keepInbox: true });
               nativeOk = 'agent.cancel(keepInbox)';
             } else if (ag) {
               nativeOk = 'agent 无 cancel 方法，等 subagent/end 确认';
+            } else if (!hasRealId) {
+              // 没有真 id：探不了，也就不能断定死活。
+              // 但也不该一直挂着 —— 记 cancel_requested，交给重启对账/超时清账收尾，
+              // 并在文案里说清楚「没探活，别以为已经停了」。
+              nativeOk = '未解析出会话 id，未探活（无法确认原生状态）';
             } else {
               // 根本没绑上 / 原生已回收：没有可中断的对象，直接落终态，别留僵尸（审计 P0-2）。
               d.updateTaskFields(tid, {
