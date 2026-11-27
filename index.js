@@ -228,6 +228,38 @@ function toTaskHandle(row) {
   };
 }
 
+/**
+ * 调用者身份（从工具 execute 的第二参拿）。
+ *
+ * 不能信台账里的 ownerSessionId —— 那是「谁创建的」，不是「现在谁在调」。
+ * 0.1.7 之前把 row.ownerSessionId 当 caller 传给 ctx.jobs，
+ * 等于替别人的任务冒充 owner，能偷看输出、能杀别人的 job（审计 P0-3）。
+ */
+function callerSessionId(exec) {
+  const ag = exec?.agent ?? null;
+  if (!ag) return null;
+  // exec.agent 的会话 id 可能在 .id 或 .session.id 上，两处都认。
+  const sid = ag.id ?? ag.session?.id ?? null;
+  return sid ? String(sid) : null;
+}
+
+/**
+ * 归属校验：这条任务是不是当前调用者的。
+ *
+ * 规则（审计 P0-3）：
+ *   - 台账里 ownerSessionId 为空（历史数据）→ 放行，避免老任务变成谁都动不了；
+ *   - 拿不到调用者身份（某些宿主/某些工具上下文没有 exec.agent）→ 放行但**不冒充** caller；
+ *   - 两者都有且不等 → 拒绝。
+ */
+function ownedBy(row, exec) {
+  const owner = row?.ownerSessionId ? String(row.ownerSessionId) : null;
+  if (!owner) return { ok: true, owner: null, caller: callerSessionId(exec) };
+  const caller = callerSessionId(exec);
+  if (!caller) return { ok: true, owner, caller: null };
+  if (caller === owner) return { ok: true, owner, caller };
+  return { ok: false, owner, caller };
+}
+
 function loadTasks() {
   const d = db();
   const tasks = {};
@@ -377,13 +409,32 @@ export function apply(ctx) {
    */
   function sweepOnce(d) {
     let swept = 0;
+    const now = Date.now();
     for (const t of d.listTasks({ limit: 500 })) {
-      if (t.type !== 'subagent' || !ACTIVE.has(t.status) || !t.nativeSessionId) continue;
-      if (getAgentHandle(ctx, t)) continue;
+      if (t.type !== 'subagent' || !ACTIVE.has(t.status)) continue;
+
+      // 有 session id：按 id 探活。
+      // 没 session id：这个 agent 从来没被接上过，探不了。但不能就这么放过 ——
+      // 那会变成永生僵尸占配额（审计 P0-2）。给它一个宽限期（默认同 deadline），
+      // 超了还没绑定，就当失联收掉：既不会误杀刚登记的，也不会永远占着。
+      let gone = false;
+      if (t.nativeSessionId) {
+        gone = !getAgentHandle(ctx, t);
+      } else {
+        const born = Number(t.createdAt) || 0;
+        const graceMs = LIMITS_READ().timeoutMinutes * 60_000;
+        const aged = born > 0 && (now - born) > graceMs;
+        // 还在等 delegation 的正常流程内（minutes 级）不碰；过了宽限期才收。
+        gone = aged;
+      }
+      if (!gone) continue;
+
       d.updateTaskFields(t.id, {
         status: 'lost',
         currentStage: 'reconciled',
-        errorSummary: '探活兜底：原生 subagent 已回收，但没收到 subagent/end',
+        errorSummary: t.nativeSessionId
+          ? '探活兜底：原生 subagent 已回收，但没收到 subagent/end'
+          : '从未绑定到会话（无反查 id），超过宽限期仍未登记，按失联收掉',
         updatedAt: Date.now(),
         completedAt: Date.now(),
       });
@@ -424,20 +475,37 @@ export function apply(ctx) {
         const ownerSessionId = String(exec?.agent?.id ?? '') || conversationId;
 
         // ---- 资源治理（任务书表 6 / A11）：创建执行器前原子占位 ----
-        // 限额配置化：DSH_COORD_LIMITS 环境变量可覆盖（JSON：{"global":3,"perOwner":2,"timeoutMinutes":120}）
+        // 限额配置化：DSH_COORD_LIMITS 环境变量可覆盖（JSON：{"global":3,"perOwner":2,"timeoutMinutes":120,"sweepSeconds":300}）
         const d = db();
+        // 数值必须校验：NaN 会让 `length >= NaN` 恒 false（限额直接失效），
+        // sweepSeconds 为 NaN 会让 setInterval 退化成 1ms 死循环（审计 P2-8）。
+        const num = (v, def, min) => {
+          const n = Number(v);
+          return Number.isFinite(n) && n >= min ? n : def;
+        };
         let LIMITS = { global: 3, perOwner: 2, timeoutMinutes: 120 };
         try {
           const raw = process.env.DSH_COORD_LIMITS;
-          if (raw) LIMITS = { ...LIMITS, ...JSON.parse(raw) };
+          if (raw) {
+            const j = JSON.parse(raw);
+            LIMITS = {
+              global: num(j?.global, 3, 1),
+              perOwner: num(j?.perOwner, 2, 1),
+              timeoutMinutes: num(j?.timeoutMinutes, 120, 1),
+            };
+          }
         } catch { /* 环境变量坏了用默认 */ }
-        const activeAll = d.listTasks({ limit: 500 }).filter((x) => ACTIVE.has(x.status));
+        // 活动任务只取活动态（不再拉全表 500 条内存过滤 —— 审计 P1-4）
+        const activeAll = d.listTasks({ statuses: [...ACTIVE], limit: 500 });
         if (activeAll.length >= LIMITS.global) {
-          return { ok: false, text: `已达全局活动任务上限（${activeAll.length}/${LIMITS.global}）。等一个结束再建，或用 DSH_COORD_LIMITS 调限额。（A11：不绕过限额启动）` };
+          return { ok: false, text: `已达全局活动任务上限（${activeAll.length}/${LIMITS.global}，DSH_COORD_LIMITS 可调）。等一个结束再建。（A11：不绕过限额启动）` };
         }
-        const mine = activeAll.filter((x) => x.conversationId === conversationId);
+        // perOwner 按**真实会话**统计，不是按模型可控的 conversationId（审计 P1-1）：
+        // 用 conversationId 会让所有会话挤同一份额度（全局上限形同虚设），
+        // 而单会话传不同 conversationId 又能直接绕过 perOwner。
+        const mine = activeAll.filter((x) => String(x.ownerSessionId ?? '') === ownerSessionId);
         if (mine.length >= LIMITS.perOwner) {
-          return { ok: false, text: `本会话活动任务已达上限（${mine.length}/${LIMITS.perOwner}）：${mine.map((x) => x.id).join('、')}。先 task_list 看看哪些该收尾。` };
+          return { ok: false, text: `本会话活动任务已达上限（${mine.length}/${LIMITS.perOwner}，DSH_COORD_LIMITS 可调）：${mine.map((x) => x.id).join('、')}。先 task_list 看看哪些该收尾。` };
         }
 
         const id = newTaskId();
@@ -497,11 +565,31 @@ export function apply(ctx) {
           const wrapped = process.platform === 'win32'
             ? ['cmd.exe', '/d', '/s', '/c', firstLine]
             : ['bash', '-c', firstLine];
+          // sandbox 对齐必须是 fail-closed：拿不到策略、confine 不可用、返回空 —— 一律拒绝，
+          // 绝不放行裸执行（issue #1 之后的深度审计 P0-1）。
+          let argv = null;
           try {
-            const policy = exec?.agent ? await ctx.sandboxPolicy?.resolve?.({ session: exec.agent.session }) : null;
-            if (policy && policy.mode !== 'danger-full-access' && typeof ctx.sandbox?.confine === 'function') {
+            const ag = exec?.agent ?? null;
+            const policy = ag ? await ctx.sandboxPolicy?.resolve?.({ session: ag.session }) : null;
+            if (!policy) {
+              // 没有策略 = 不知道该怎么限制 → 拒绝，而不是当成 allow
+              d.updateTaskFields(id, { status: 'failed', errorSummary: 'sandbox 策略不可解析', updatedAt: Date.now(), completedAt: Date.now() });
+              return { ok: false, text: `建任务失败：拿不到本会话的沙箱策略（sandboxPolicy.resolve 无结果），拒绝无沙箱执行。（taskId=${id}）` };
+            }
+            if (policy.mode === 'danger-full-access') {
+              // 显式放行：直接用原始 argv，这是宿主明确允许的
+              argv = wrapped;
+            } else {
+              if (typeof ctx.sandbox?.confine !== 'function') {
+                d.updateTaskFields(id, { status: 'failed', errorSummary: 'sandbox.confine 不可用', updatedAt: Date.now(), completedAt: Date.now() });
+                return { ok: false, text: `建任务失败：会话策略是 ${policy.mode} 但宿主没有 sandbox.confine，拒绝无沙箱执行。（taskId=${id}）` };
+              }
               const sandboxed = await ctx.sandbox.confine(wrapped, policy);
-              if (Array.isArray(sandboxed?.argv) && sandboxed.argv.length) wrapped.splice(0, wrapped.length, ...sandboxed.argv);
+              if (!Array.isArray(sandboxed?.argv) || !sandboxed.argv.length) {
+                d.updateTaskFields(id, { status: 'failed', errorSummary: 'sandbox.confine 返回空 argv', updatedAt: Date.now(), completedAt: Date.now() });
+                return { ok: false, text: `建任务失败：sandbox.confine 没有返回可用 argv，拒绝无沙箱执行。（taskId=${id}）` };
+              }
+              argv = sandboxed.argv.map(String);
             }
           } catch (e) {
             d.updateTaskFields(id, { status: 'failed', errorSummary: `sandbox 拒绝: ${String(e).slice(0, 120)}`, updatedAt: Date.now(), completedAt: Date.now() });
@@ -513,10 +601,25 @@ export function apply(ctx) {
               label: title,
               owner: ownerSessionId,
               run(job) {
-                const child = spawn(parts[0], parts.slice(1), {
-                  shell: true,
+                // 关键：用 argv（confine 后的结果），不是 parts。
+                // 0.1.4–0.1.7 一直 spawn(parts...) —— confine 白算了，沙箱 100% 绕过（审计 P0-1）。
+                // argv 里已经是完整命令行（如 ['cmd.exe','/d','/s','/c', 原文] 或 confine 给的形式），
+                // 所以 shell 不能再开一层，否则会二次解析、把引号搞坏。
+                const child = spawn(argv[0], argv.slice(1), {
+                  shell: false,
                   windowsHide: true,
                   cwd,
+                  // 非 Windows 上让子进程自成一个进程组，cancel 时才能整组杀干净；
+                  // Windows 用 taskkill /T 走进程树，不需要这个。
+                  detached: process.platform !== 'win32',
+                });
+                // 异步 error 不接住会把整个宿主进程打崩（audit P1-2）：cwd 被删、权限不足、
+                // 进程数上限都会走这条。接住并当成失败结算，别让它冒到 EventEmitter。
+                let spawnError = null;
+                child.on('error', (e) => {
+                  spawnError = e;
+                  try { job.append(`\n[coordinator] spawn 失败：${String(e).slice(0, 200)}\n`, { channel: 'stderr' }); } catch { /* 推不进也不影响结算 */ }
+                  try { job.updateProgress('启动失败'); } catch { /* 注册表无此方法 */ }
                 });
                 const decodeOut = makeChunkDecoder();
                 const decodeErr = makeChunkDecoder();
@@ -541,18 +644,33 @@ export function apply(ctx) {
                 }
                 return {
                   cancel() {
-                    // shell:true 起的是 cmd.exe，它下面的真进程不跟着死——
-                    // 必须按进程树杀（taskkill /T），否则台账标了 cancelled、进程还在跑。
+                    // 必须连子孙一起杀：只杀父 shell 的话，它下面的真进程会变孤儿继续跑，
+                    // 台账标了 cancelled、进程还在（审计 P1-2 ③）。
                     try {
-                      if (process.platform === 'win32' && child.pid) {
+                      if (!child.pid) return;
+                      if (process.platform === 'win32') {
                         execSync(`taskkill /T /F /PID ${child.pid}`, { stdio: 'ignore' });
                       } else {
-                        child.kill('SIGKILL');
+                        // 非 Windows：spawn 时用了 detached，子进程自成进程组，
+                        // 负 pid 就是整组（包括孙进程）。
+                        try { process.kill(-child.pid, 'SIGKILL'); }
+                        catch { child.kill('SIGKILL'); }  // 没有独立进程组就退化为杀单个
                       }
                     } catch { /* 已退出 */ }
                   },
                   done: new Promise((resolve) => {
-                    child.on('close', (code) => {
+                    // spawn 失败时 close 不一定触发（进程根本没起来），done 会永久悬空。
+                    // 监听 error 单独收口，避免任务永远卡在 running（审计 P1-2）。
+                    child.on('error', (e) => {
+                      resolve({ status: 'failed', detail: `spawn error: ${String(e).slice(0, 180)}` });
+                    });
+                    // close 第二参是 signal：被信号杀掉时 code 为 null，光看 code 会误报
+                    // 「exit null」。把 signal 一起写进 detail（审计 P1-2 ②）。
+                    child.on('close', (code, signal) => {
+                      if (signal) {
+                        resolve({ status: 'failed', detail: `killed by ${signal}` });
+                        return;
+                      }
                       resolve(code === 0
                         ? { status: 'completed' }
                         : { status: 'failed', detail: `exit ${code}` });
@@ -601,13 +719,20 @@ export function apply(ctx) {
         },
       },
       output: textOut(),
-      async execute(args) {
+      async execute(args, exec) {
         const d = db();
         // 兜底探活：**只有 task_list 会写台账**（2026-11-27 issue #1 A1 ——
         // describe 曾也调它，但那是只读工具写终态，会把瞬时查不到的活任务打死）。
         const swept = sweepOnce(d);
         if (swept) log(`探活兜底：${swept} 条 subagent 任务原生已回收，补落 lost`);
-        const all = d.listTasks({ limit: 500 }).sort((a, b) => b.createdAt - a.createdAt);
+        // 只列自己的（审计 P0-3）：拿不到调用者身份时按原样全列（历史兼容）。
+        const caller = callerSessionId(exec);
+        const visible = (t) => {
+          if (!caller) return true;
+          const owner = t.ownerSessionId ? String(t.ownerSessionId) : null;
+          return !owner || owner === caller;
+        };
+        const all = d.listTasks({ limit: 500 }).filter(visible).sort((a, b) => b.createdAt - a.createdAt);
         const wantAll = Boolean(args?.all);
         const rows = (wantAll ? all : all.filter((t) => ACTIVE.has(t.status))).slice(0, 50);
         if (!rows.length) return { ok: true, text: '（无任务）' };
@@ -633,7 +758,7 @@ export function apply(ctx) {
         },
       },
       output: textOut(),
-      async execute(args) {
+      async execute(args, exec) {
         const d = db();
         // 只读工具不写台账（2026-11-27 issue #1 A1）。
         //
@@ -645,6 +770,9 @@ export function apply(ctx) {
         const tid = String(args?.taskId ?? '');
         const row = d.getTask(tid);
         if (!row) return { ok: false, text: `任务不存在：${args?.taskId}` };
+        // 归属校验（审计 P0-3）：别人的任务不给看。返回同一句话，不泄露它存在与否。
+        const own = ownedBy(row, exec);
+        if (!own.ok) return { ok: false, text: `任务不存在：${args?.taskId}` };
         const t = toTaskHandle(row);
         t.context = d.getContext(tid) ?? null;
         const lines = [
@@ -801,11 +929,19 @@ export function apply(ctx) {
         },
       },
       output: textOut(),
-      async execute(args) {
+      async execute(args, exec) {
         const d = db();
         const tid = String(args?.taskId ?? '');
         const row = d.getTask(tid);
         if (!row) return { ok: false, text: `任务不存在：${args?.taskId}` };
+        // 归属校验（审计 P0-3）：不能往别人的子代理里注入指令。
+        const own = ownedBy(row, exec);
+        if (!own.ok) return { ok: false, text: `任务不存在：${args?.taskId}` };
+        // 终态任务不投递（审计 P2-4）：可续聊子代理可能还驻留内存，
+        // followup 会把它唤醒跑新一轮，而台账停在 succeeded，两边对不上。
+        if (TERMINAL.has(row.status)) {
+          return { ok: false, text: `任务已终态（${row.status}），不再投递指令。要续跑请新建任务。` };
+        }
         const content = String(args?.content ?? '');
         if (!content.trim()) return { ok: false, text: '指令内容为空' };
         const mode = args?.mode === 'next-step' ? 'next-step' : 'next-turn';
@@ -928,11 +1064,14 @@ export function apply(ctx) {
         },
       },
       output: textOut(),
-      async execute(args) {
+      async execute(args, exec) {
         const d = db();
         const tid = String(args?.taskId ?? '');
         const row = d.getTask(tid);
         if (!row) return { ok: false, text: `任务不存在：${args?.taskId}` };
+        // 归属校验（审计 P0-3）：不能杀别人的任务。
+        const own = ownedBy(row, exec);
+        if (!own.ok) return { ok: false, text: `任务不存在：${args?.taskId}` };
         if (TERMINAL.has(row.status)) return { ok: false, text: `任务已终态（${row.status}），无需取消` };
         if (row.status === 'cancel_requested') {
           return { ok: true, text: `取消已请求过（task ${tid}），等执行器确认，别重复发。` };
@@ -942,13 +1081,47 @@ export function apply(ctx) {
         let nativeOk = null;
         try {
           if (t.type === 'job' && ctx.jobs?.kill) {
-            // 契约：kill(id, caller?, reason?)。有主 job 的 caller 必须 = owner（assertAccess 围栏），
-            // 用台账 owner_session_id（task_create 时落的真实会话 id）；无主 job 才传 undefined。
-            ctx.jobs.kill(t.nativeId, row.ownerSessionId ?? undefined, reason);
+            // caller 必须是**真实的调用者**，不能用台账里的 ownerSessionId 冒充 ——
+            // 那等于替别人的任务假冒 owner，能杀掉本不该有权杀的任务（审计 P0-3）。
+            // 拿不到调用者身份时才退回 owner（历史任务/无 exec 的宿主）。
+            const killCaller = own.caller ?? own.owner ?? undefined;
+            ctx.jobs.kill(t.nativeId, killCaller, reason);
             nativeOk = 'killed';
-          } else if (t.type === 'subagent' && t.nativeId) {
-            // 原生取消走 interrupt_agent 工具（模型侧）；插件层直接可达性是 V6 探测点
-            nativeOk = 'interrupt-requested(经模型工具)';
+          } else if (t.type === 'subagent') {
+            // 真的去中断它，不是只写一句字符串（审计 P1-3）：
+            // 0.1.7 这里只赋了个 'interrupt-requested(经模型工具)'，模型看到
+            // 「已请求取消」就不会再动手，子代理照常跑完并产生全部副作用。
+            const ag = getAgentHandle(ctx, t);
+            if (ag && typeof ag.cancel === 'function') {
+              ag.cancel({ kind: 'user' }, { keepInbox: true });
+              nativeOk = 'agent.cancel(keepInbox)';
+            } else if (ag) {
+              nativeOk = 'agent 无 cancel 方法，等 subagent/end 确认';
+            } else {
+              // 根本没绑上 / 原生已回收：没有可中断的对象，直接落终态，别留僵尸（审计 P0-2）。
+              d.updateTaskFields(tid, {
+                status: 'cancelled',
+                currentStage: 'cancelled',
+                errorSummary: `${reason}（原生 agent 已不在，直接收尾）`,
+                updatedAt: Date.now(),
+                completedAt: Date.now(),
+              });
+              emitEvent(null, tid, 'task.cancelled', 'user', reason);
+              settleNotification(null, { id: tid, status: 'cancelled' });
+              return { ok: true, text: `task ${tid} 已取消（原生 agent 已不在，无需中断）。` };
+            }
+          } else {
+            // job 但宿主没有 kill：没有能中断的执行器，直接收尾。
+            d.updateTaskFields(tid, {
+              status: 'cancelled',
+              currentStage: 'cancelled',
+              errorSummary: `${reason}（宿主无 jobs.kill，直接收尾）`,
+              updatedAt: Date.now(),
+              completedAt: Date.now(),
+            });
+            emitEvent(null, tid, 'task.cancelled', 'user', reason);
+            settleNotification(null, { id: tid, status: 'cancelled' });
+            return { ok: true, text: `task ${tid} 已取消（宿主无 jobs.kill）。` };
           }
         } catch (e) {
           nativeOk = `cancel 调用失败: ${String(e).slice(0, 160)}`;
@@ -993,11 +1166,14 @@ export function apply(ctx) {
         required: ['taskId'],
       },
       output: textOut(),
-      async execute(args) {
+      async execute(args, exec) {
         const d = db();
         const tid = String(args?.taskId ?? '');
         const row = d.getTask(tid);
         if (!row) return { ok: false, text: `任务不存在：${args?.taskId}` };
+        // 归属校验（审计 P0-3）：不能读写别人的任务上下文。
+        const own = ownedBy(row, exec);
+        if (!own.ok) return { ok: false, text: `任务不存在：${args?.taskId}` };
 
         const clean = (v) => (Array.isArray(v) ? v : [])
           .map((x) => String(x).slice(0, 200))
@@ -1023,9 +1199,18 @@ export function apply(ctx) {
             pendingIssues: args?.pending !== undefined ? clean(args.pending) : (ctxNow.pendingIssues ?? ctxNow.pending ?? []),
             updatedAt: Date.now(),
           };
-          const bytes = Buffer.byteLength(JSON.stringify(next), 'utf8');
+          // 8 KB 上限只量**本工具管的字段**，不量 objective（审计 P2-5）：
+          // objective 是任务目标，可能本身就 8 KB 以上；把它算进来会让
+          // task_context 对这个任务永久不可写（哪怕只写一个 stage）。
+          const sized = {
+            currentStage: next.currentStage,
+            decisions: next.decisions,
+            changedFiles: next.changedFiles,
+            pendingIssues: next.pendingIssues,
+          };
+          const bytes = Buffer.byteLength(JSON.stringify(sized), 'utf8');
           if (bytes > 8192) {
-            return { ok: false, text: `上下文太大（${bytes} 字节 > 8192），缩一缩再写。` };
+            return { ok: false, text: `上下文太大（${bytes} 字节 > 8192，只算 stage/decisions/changedFiles/pending），缩一缩再写。` };
           }
           // 乐观锁写：版本冲突拒绝
           const wrote = d.updateContextOptimistic(ctxNow.version || 0, next);
@@ -1180,9 +1365,16 @@ export function apply(ctx) {
           const v = ctx.jobs?.get?.(t.nativeId, t.ownerSessionId ?? undefined);
           alive = !!v && (v.status === 'running' || v.status === 'stopping');
         } else if (t.type === 'subagent' && (t.nativeSessionId || t.nativeId)) {
-          // 只认 session id：反查出 id 的按 id 探活；没解析出的（nativeSessionId=null）
-          // 拿名字探必然查不到 —— 那种情况不该判 lost（是不知道，不是死了），留给兜底与显式取消。
-          alive = t.nativeSessionId ? !!getAgentHandle(ctx, t) : true;
+          // 只认 session id：反查出 id 的按 id 探活。
+          //
+          // 没解析出 id 的（nativeSessionId=null）以前恒判 alive=true —— 那是「不知道」，
+          // 但后果是永生僵尸：重启之后原生 agent 早没了，这条任务永远停在 ACTIVE，
+          // 永久占住 perOwner/global 配额，只能删库解锁（审计 P0-2）。
+          //
+          // 正确判据：重启（本函数只在 apply() 里跑）意味着上一个进程内的 agent 全没了。
+          // 没有 session id 就无法重新接上它 —— 所以这里应当落 lost，而不是假装活着。
+          // 想在重启后继续跑的，只能在运行时用 task_cancel 收尾，或重新建任务。
+          alive = t.nativeSessionId ? !!getAgentHandle(ctx, t) : false;
         } else {
           alive = false;
         }

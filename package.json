@@ -1,6 +1,6 @@
 {
   "name": "dsh-background-task-coordinator",
-  "version": "0.1.7",
+  "version": "0.1.8",
   "private": true,
   "type": "module",
   "description": "DSH 后台任务协调器：后台 Subagent/Job 并行执行，前台始终可交流。任务台账、追加指令、结算通知、资源锁。独立插件，零核心改动。",
