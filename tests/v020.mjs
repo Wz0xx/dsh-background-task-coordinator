@@ -5,7 +5,8 @@ import { mkCtx } from './mockctx.mjs';
 import fs from 'node:fs'; import os from 'node:os'; import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 
-const ROOT = 'file:///C:/Users/stop/.dsh/worlds/default/room/background-task-coordinator';
+// 相对导入：仓库 clone 到哪都能跑，不写死某台机器的绝对路径
+const ROOT = new URL('..', import.meta.url).href.slice(0, -1);
 const P = [];
 const ok = (n, c, d = '') => P.push(`${c ? '✅' : '❌'} ${n}${d ? `  (${d})` : ''}`);
 // 临时目录清理必须容错：GBK 用例会留一个刚起的子进程，句柄没放时 rmSync 会 EPERM。

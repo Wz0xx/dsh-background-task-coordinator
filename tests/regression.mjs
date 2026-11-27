@@ -7,7 +7,8 @@ process.env.USERPROFILE = fakeHome; process.env.HOME = fakeHome;
 process.env.DSH_PROFILE_DIR = path.join(fakeHome, '.dsh', 'profiles', 'regtest');
 delete process.env.DSH_PROFILE;
 process.env.DSH_COORD_LIMITS = JSON.stringify({global:20, perOwner:20, timeoutMinutes:120, sweepSeconds:600});
-const mod = await import('file:///C:/Users/stop/.dsh/worlds/default/room/background-task-coordinator/index.js');
+// 用相对本文件的 URL 导入被测代码：仓库 clone 到哪都能跑，不写死某台机器的绝对路径。
+const mod = await import(new URL('../index.js', import.meta.url).href);
 
 const R = {}, log = [], alive = new Set(), confined = [], listeners = {};
 const state = { kill: null, cancelCalled: false };

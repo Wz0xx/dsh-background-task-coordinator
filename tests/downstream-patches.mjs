@@ -5,7 +5,8 @@ process.env.USERPROFILE=fakeHome; process.env.HOME=fakeHome;
 process.env.DSH_PROFILE_DIR = path.join(fakeHome, '.dsh', 'profiles', 'ptest');
 delete process.env.DSH_PROFILE;
 process.env.DSH_COORD_LIMITS = JSON.stringify({global:20, perOwner:20, timeoutMinutes:120, sweepSeconds:600});
-const mod = await import('file:///C:/Users/stop/.dsh/worlds/default/room/background-task-coordinator/index.js');
+// 相对导入：仓库 clone 到哪都能跑
+const mod = await import(new URL('../index.js', import.meta.url).href);
 const R={}, log=[], alive=new Set();
 const state={cancelCalled:false};
 const ctx = mkCtx({
@@ -34,7 +35,7 @@ ok('补丁2 落 cwdFallback 标记', lab.cwdFallback==='true', JSON.stringify(la
 ok('补丁2 记了实际 cwd', typeof lab.cwd==='string' && lab.cwd.length>0, lab.cwd);
 
 // 补丁1: 默认限额 5/4（本测用环境变量覆盖成 20，验的是代码里默认字面量已改）
-const src = fs.readFileSync('C:/Users/stop/.dsh/worlds/default/room/background-task-coordinator/index.js','utf8');
+const src = fs.readFileSync(new URL('../index.js', import.meta.url), 'utf8');
 ok('补丁1 默认 global:5 perOwner:4', src.includes('global: 5, perOwner: 4'));
 
 // 补丁3: sandbox 服务不可用 vs 真拒绝 要分开
