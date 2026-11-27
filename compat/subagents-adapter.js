@@ -43,9 +43,39 @@ export async function resolveSubagentSessionId(ctx, agentName, caller, given) {
   const name = String(agentName ?? '').trim();
   if (!name) return null;
 
-  // 调用方明确给了、且明显不是名字本身 → 直接信它
+  // 调用方明确给了、且不等于 agent 名 → 要用，但**先核实它真的是一个会话 id**
+  // （0.2.1 修，审计 P1-6）。
+  //
+  // 0.2.0 是「给了就信」：`if (g && g !== name) return g;` 直接原样落库。
+  // 问题是这个字段由模型填，什么都能塞进去 —— 一个随手写的「随便」「abc」会被当成
+  // 会话 id 存进 native_session_id，之后所有按 id 的探活、结算匹配、取消全部落空。
+  //
+  // 0.2.1 的判据要**松到不打断正常时序**（原生工具刚返回 sessionId 时，
+  // agents 注册表往往还没登记；测试/其它宿主也可能用 `sess-xxx` 这种短 id）：
+  //   ① 排除明显不是 id 的（空串、纯中文、带空格、超短）；
+  //   ② 注册表能查到 → 确认；查不到 → 接受但算「未核实」，不当成已确认。
+  // 只有真正不像 id 的才丢掉、进反查。这一条是被测试逼出来的：一开始写成
+  // 「必须是 UUID」，结果 `sess-F1` 这种合法短 id 被打断，补投直接失效。
   const g = String(given ?? '').trim();
-  if (g && g !== name) return g;
+  if (g && g !== name) {
+    // 「像 id」= 无空白、非全中文、长度 >= 4。
+    // 会话 id 的真实形态在这些宿主里并不统一（UUID、session-xxx、sess-F1 都见过），
+    // 所以不能按某一种格式硬卡，只能排除明显是话而不是 id 的。
+    const looksLikeId = g.length >= 4 && !/\s/.test(g) && !/^[\u4e00-\u9fa5]+$/.test(g);
+    if (looksLikeId) {
+      const agents = (() => {
+        try { return typeof ctx?.get === 'function' ? ctx.get('agents') : undefined; } catch { return undefined; }
+      })();
+      if (agents && typeof agents.get === 'function') {
+        try {
+          if (agents.get(g)) return g;   // 注册表里有 → 确认是活会话 id
+        } catch { /* 查询抛错 → 下面按未核实处理 */ }
+      }
+      // 格式过得去、注册表暂时查不到（或没有 agents 服务）：接受，但未核实。
+      return g;
+    }
+    // 不像 id：进反查，别把它当 id 落库。
+  }
 
   const sub = getSubagentsService(ctx);
   if (!sub) return null;
@@ -61,7 +91,12 @@ export async function resolveSubagentSessionId(ctx, agentName, caller, given) {
   }
 
   // ---- 路径二：0.2.1 的 listChildren（扫父会话的子级目录，按 label 匹配） ----
-  const parentSid = caller?.session?.id ?? caller?.sessionId ?? null;
+  //
+  // 父会话 id 的取法要全（0.2.1 修，审计 P1-6）：0.2.0 只认 `caller.session.id`
+  // 和 `caller.sessionId`，漏了 `caller.id` —— 而空态兜底造出来的 caller 恰恰是
+  // `{ session: {...}, id }` 形态，别的宿主也可能只给 .id。
+  // 结果：`{ id: 'parent-only-id' }` 这种 caller 会让这条路径整个跳过、直接返回 null。
+  const parentSid = caller?.session?.id ?? caller?.sessionId ?? caller?.id ?? null;
   if (typeof sub.listChildren === 'function' && parentSid) {
     try {
       const kids = await sub.listChildren(parentSid);

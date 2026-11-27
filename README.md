@@ -48,7 +48,7 @@ background jobs unavailable: no job controller serves this agent
 
 ### 方式一：tgz / zip（推荐，干净）
 
-1. 把 `dsh-background-task-coordinator-0.1.4.tgz`（或 0.1.4.zip，内容一致）放到任意目录。
+1. 把 `dsh-background-task-coordinator-<版本>.tgz`（或同名 `.zip`，内容一致）放到任意目录。
 2. 找到两个路径：
    - DSH 自带的 pnpm：`<DSH 安装目录>\resources\runtime\x64\primary-runtime\dependencies\pnpm\bin\pnpm.mjs`
    - 你的 profile：`<DSH_HOME>\profiles\<profile 名>`
@@ -239,17 +239,37 @@ background jobs unavailable: no job controller serves this agent
 | 多 profile 共用一个库 | 开第二个 profile 会把第一个的任务全标 `lost` | 按 profile 隔离路径；加 `busy_timeout` |
 | `dispose()` 不关 `_sqlite` | 重载累积连接、`-wal` 永不 checkpoint | 关库 + `wal_checkpoint(TRUNCATE)` |
 | `stopReason` 空串落 `failed` | 假失败（和以前假成功一样糟） | 按宿主真实枚举映射，空串落 `succeeded` 但注明「未给出原因」 |
-| **`cmd /s /c` 把引号拼成字面量**（新发现） | 任何带引号/带空格的命令都报 `Cannot find module '..."..."'` | `spawn` 加 `windowsVerbatimArguments` |
+| **`cmd /s /c` 把引号拼成字面量**（新发现） | 任何带引号/带空格的命令都报 `Cannot find module '..."..."'` | `spawn` 加 `windowsVerbatimArguments`（仅 danger-full-access 分支） |
 
-测试从两套变三套，**66 项全绿**：
+测试三套，**88 项全绿**（0.2.1 起）：
 
 ```
 主回归      16/16
-下游补丁     8/8
-0.2.0 专项  45/45
+下游补丁     9/9
+专项       63/63
 ```
 
 其中几条是专门设计成「能反驳自己」的——比如断言旧 `listTasks({limit:500})` 写法在 601 条台账下**确实漏掉活动任务**，用来证明修的是真 bug。迁移那条用本机真实旧库（含 2.1 MB WAL）跑过：29 任务 / 53 事件 / 5 消息全保留。
+
+## 九点六、0.2.1 改了什么
+
+0.2.0 发布后收到一份逐行核验报告（带行号和复现方法），核出**我在修的过程中新引入的 7 处退化**。全部核实属实，这一版逐条修掉：
+
+| 问题 | 后果 | 现状 |
+|---|---|---|
+| `task_register_delegation` 漏 `ownedBy` | 任何会话知道 taskId 就能劫持别人的任务，并借 pending 补投**把别人排队的指令刷给自己** | 补上归属校验 |
+| `task_describe` 仍用台账 owner 当 caller | 冒充 owner 读别人的 job 输出，穿透 assertAccess 围栏 | 改用真实调用者 |
+| `task_cancel` 对未绑定 queued 之代理 | 分支顺序错，取消后卡在 `cancel_requested` 永不落地 | 从未绑定直接落 cancelled |
+| `getAgentHandle` 抛错后 3 处没接 | 一条子代理查询异常就把 `task_list` / `task_append_message` 打崩 | 全部接住，探活失败不当成「已死」 |
+| 迁移丢外键与 CHECK | 重建后的表比迁移前更松：孤儿消息、非法 status 都能写进去 | 保留约束；判据改成看表结构而不只看版本号 |
+| `windowsVerbatimArguments` 无条件开 | 沙箱包装器里 `C:\Program Files\...` 这类路径被劈成多个参数 | 只对 danger-full-access 分支开 |
+| `resolveSubagentSessionId` 漏 `caller.id` + 盲信 `given` | 空态兜底造出的 caller 反查必败；模型乱填的字符串被当成会话 id 落库 | 补 `caller.id`；`given` 先做「像不像 id」判断 |
+
+另外清掉：`lib/storage/{task-store,event-store}.js`（引用了已删除的 `lib/core`，导入即 `ERR_MODULE_NOT_FOUND`，还一直随包发布）、`currentStage` 停在 `creating-executor`、`task_probe` 直取未 inject 服务、pending 正文被截到 500 字（补投时等于把指令砍半投出去）。
+
+`config` 现在真的管住 `task_create` —— 0.2.0 里它只对维护循环生效，限额仍读环境变量那一套（实测传 `{global:1}` 仍能建第 2 个、`deadlineMinutes` 仍落 120）。
+
+**一处取舍要说明**：核验报告建议对 `given` 严格校验，我一开始写成「必须是 UUID」，结果把 `sess-F1` 这种合法短 id 也打断了，补投直接失效——这是测试逼出来的。现在只排除明显是话不是 id 的（空、含空格、纯中文、超短），其余接受但算「未核实」。
 
 ---
 

@@ -34,9 +34,47 @@ const lab = t1 ? JSON.parse(get1("SELECT labels FROM tasks WHERE id=?", t1)?.lab
 ok('补丁2 落 cwdFallback 标记', lab.cwdFallback==='true', JSON.stringify(lab).slice(0,80));
 ok('补丁2 记了实际 cwd', typeof lab.cwd==='string' && lab.cwd.length>0, lab.cwd);
 
-// 补丁1: 默认限额 5/4（本测用环境变量覆盖成 20，验的是代码里默认字面量已改）
-const src = fs.readFileSync(new URL('../index.js', import.meta.url), 'utf8');
-ok('补丁1 默认 global:5 perOwner:4', src.includes('global: 5, perOwner: 4'));
+// 补丁1: 默认限额 5/4
+//   这里原来查源码字面量 `'global: 5, perOwner: 4'` —— 0.2.1 把那套合并进 LIMITS_READ、
+//   拆成多行了，字面量断言立刻误报。改成**行为断言**：不设任何环境变量、
+//   不传 config 起一个实例，验限额与 deadline 用的就是 5/4/120。
+{
+  const home2 = fs.mkdtempSync(path.join(os.tmpdir(),'dflt-'));
+  const saved = { U: process.env.USERPROFILE, H: process.env.HOME, P: process.env.DSH_PROFILE_DIR, L: process.env.DSH_COORD_LIMITS };
+  process.env.USERPROFILE = home2; process.env.HOME = home2;
+  process.env.DSH_PROFILE_DIR = path.join(home2, '.dsh', 'profiles', 'dflt');
+  delete process.env.DSH_COORD_LIMITS;
+  const mod2 = await import(new URL('../index.js', import.meta.url).href + '?dflt=1');
+  const R3 = {};
+  const ctx3 = mkCtx({
+    logger:{info:()=>{}},
+    jobs:{start(){return 'nj'},get(){return{status:'running'}},readAt(){return{chunks:[]}},kill(){},events:{subscribe(){return()=>{}}}},
+    agents:{get(){return undefined}},
+    workingDirectory:{ensure:async()=>process.cwd()},
+    sandboxPolicy:{resolve:async()=>({mode:'danger-full-access'})},
+    sandbox:{confine:async a=>({argv:a})},
+    tools:{register(t){R3[t.name]=t}}, on(){return()=>{}},
+  });
+  mod2.default.apply(ctx3, {});   // 不传 config
+  const ex = { agent:{ id:'s-dflt', session:{ id:'s-dflt' } } };
+  const rr = await R3.task_create.execute({type:'job', title:'d', objective:'echo hi'}, ex);
+  const tid3 = rr.text.match(/taskId=([\w-]+)/)?.[1];
+  const dbp3 = path.join(home2,'.dsh','background-task-coordinator','dflt','tasks.db');
+  const { DatabaseSync: DS3 } = await import('node:sqlite');
+  const ro3 = new DS3(dbp3, { readOnly: true });
+  const lab3 = JSON.parse(ro3.prepare("SELECT labels FROM tasks WHERE id=?").get(tid3)?.labels ?? '{}');
+  ro3.close();
+  ok('补丁1 默认限额 5/4 且 deadline=120', lab3.deadlineMinutes === '120', JSON.stringify(lab3).slice(0,60));
+  // 同一会话连建 5 个：第 5 个应被 perOwner=4 挡住（4 比 global=5 先撞上，顺序是对的）
+  for (let i=0;i<3;i++) await R3.task_create.execute({type:'job', title:`d${i}`, objective:'echo hi'}, ex);
+  const r5 = await R3.task_create.execute({type:'job', title:'d4', objective:'echo hi'}, ex);
+  ok('补丁1 同会话第 5 个撞 perOwner=4', !r5.ok && r5.text.includes('/4'), r5.text.slice(0,40));
+  if (saved.U !== undefined) process.env.USERPROFILE = saved.U;
+  if (saved.H !== undefined) process.env.HOME = saved.H;
+  if (saved.P !== undefined) process.env.DSH_PROFILE_DIR = saved.P;
+  if (saved.L !== undefined) process.env.DSH_COORD_LIMITS = saved.L;
+  try { fs.rmSync(home2,{recursive:true,force:true,maxRetries:3}); } catch {}
+}
 
 // 补丁3: sandbox 服务不可用 vs 真拒绝 要分开
 //   这里 sandboxPolicy 有、confine 有 → 正常。构造一个「服务不存在」的场景：

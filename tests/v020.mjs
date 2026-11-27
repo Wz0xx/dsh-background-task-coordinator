@@ -78,7 +78,8 @@ const rm = (p) => { try { fs.rmSync(p, { recursive: true, force: true, maxRetrie
   db.close();
   const db2 = new CoordinatorDatabase(oldDb);
   const meta = db2.db.prepare("SELECT value FROM meta WHERE key='schema.task_messages.unique'").get();
-  ok('0.6 迁移版本落 meta 且不重复迁移', Number(meta?.value) === 2 && db2.listMessages('tA').length === 1, `v=${meta?.value}`);
+  // 目标版本 3（0.2.1 起）：2 是 0.2.0 那个「联合唯一有了但外键/CHECK 丢了」的残缺状态。
+  ok('0.6 迁移版本落 meta 且不重复迁移', Number(meta?.value) === 3 && db2.listMessages('tA').length === 1, `v=${meta?.value}`);
   db2.close();
   rm(home);
 }
@@ -532,6 +533,280 @@ const rm = (p) => { try { fs.rmSync(p, { recursive: true, force: true, maxRetrie
   } catch { crashed = true; }
   ok('8.3 垃圾配置不崩、不退化成 1ms 死循环', !crashed && typeof d2 === 'function');
   if (typeof d2 === 'function') d2();
+  rm(home);
+}
+
+// ---------------------------------------------------------------------------
+// 9. 审计 #4：yml 的 config 必须真的管住 task_create（0.2.0 里它只对维护循环生效）
+// ---------------------------------------------------------------------------
+{
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'v021-cfg2-'));
+  const saved = { U: process.env.USERPROFILE, H: process.env.HOME, P: process.env.DSH_PROFILE_DIR, L: process.env.DSH_COORD_LIMITS };
+  process.env.USERPROFILE = home; process.env.HOME = home;
+  process.env.DSH_PROFILE_DIR = path.join(home, '.dsh', 'profiles', 'cfg2');
+  delete process.env.DSH_PROFILE;
+  delete process.env.DSH_COORD_LIMITS;
+
+  const mod = await import(`${ROOT}/index.js?sec=cfg2limit`);
+  const R = {};
+  const ctx = mkCtx({
+    logger: { info: () => {} },
+    jobs: { start() { return 'nj'; }, get() { return { status: 'running' }; }, readAt() { return { chunks: [] }; }, kill() {}, events: { subscribe() { return () => {}; } } },
+    agents: { get() { return undefined; } },
+    workingDirectory: { ensure: async () => process.cwd() },
+    sandboxPolicy: { resolve: async () => ({ mode: 'danger-full-access' }) },
+    sandbox: { confine: async (a) => ({ argv: a }) },
+    tools: { register(t) { R[t.name] = t; } }, on() { return () => {}; },
+  });
+  // config 写死 global:1 / perOwner:1 / timeoutMinutes:5 —— 建任务必须照这个来
+  const dispose = mod.default.apply(ctx, { global: 1, perOwner: 1, timeoutMinutes: 5, sweepSeconds: 600, retentionDays: 30 });
+  const ex = { agent: { id: 's-cfg', session: { id: 's-cfg' } } };
+
+  const r1 = await R.task_create.execute({ type: 'job', title: 'first', objective: 'echo hi' }, ex);
+  ok('9.1 config.global=1 时第一个能建', r1.ok, r1.text.split('\n')[0].slice(0, 30));
+
+  const r2 = await R.task_create.execute({ type: 'job', title: 'second', objective: 'echo hi' }, ex);
+  ok('9.2 config.global=1 时第二个被挡住（0.2.0 这里会放行）',
+    !r2.ok && /\/1/.test(r2.text), r2.text.slice(0, 50));
+
+  const tid = r1.text.match(/taskId=([\w-]+)/)?.[1];
+  const dbp = path.join(home, '.dsh', 'background-task-coordinator', 'cfg2', 'tasks.db');
+  const { DatabaseSync } = await import('node:sqlite');
+  const ro = new DatabaseSync(dbp, { readOnly: true });
+  const lab = JSON.parse(ro.prepare("SELECT labels FROM tasks WHERE id=?").get(tid)?.labels ?? '{}');
+  ro.close();
+  ok('9.3 config.timeoutMinutes=5 时 deadlineMinutes 落 5（0.2.0 这里恒 120）',
+    lab.deadlineMinutes === '5', `deadlineMinutes=${lab.deadlineMinutes}`);
+
+  if (typeof dispose === 'function') dispose();
+  if (saved.U !== undefined) process.env.USERPROFILE = saved.U;
+  if (saved.H !== undefined) process.env.HOME = saved.H;
+  if (saved.P !== undefined) process.env.DSH_PROFILE_DIR = saved.P;
+  if (saved.L !== undefined) process.env.DSH_COORD_LIMITS = saved.L;
+  rm(home);
+}
+
+// ---------------------------------------------------------------------------
+// 10. 审计回归：0.2.0 引入的越权 / 崩溃 / 约束丢失（0.2.1 修）
+// ---------------------------------------------------------------------------
+{
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'v021-reg-'));
+  const saved = { U: process.env.USERPROFILE, H: process.env.HOME, P: process.env.DSH_PROFILE_DIR, L: process.env.DSH_COORD_LIMITS };
+  process.env.USERPROFILE = home; process.env.HOME = home;
+  process.env.DSH_PROFILE_DIR = path.join(home, '.dsh', 'profiles', 'reg');
+  delete process.env.DSH_PROFILE;
+  delete process.env.DSH_COORD_LIMITS;
+
+  const mod = await import(`${ROOT}/index.js?sec=reg`);
+  const R = {}, alive = new Set(), got = [];
+  const ctx = mkCtx({
+    logger: { info: () => {} },
+    jobs: { start() { return 'nj'; }, get() { return { status: 'running' }; }, readAt() { return { chunks: [] }; }, kill() {}, events: { subscribe() { return () => {}; } } },
+    agents: {
+      get(id) {
+        if (id === 'sess-VICTIM') throw new Error('registry transient failure');  // 探活抛错
+        return alive.has(id) ? {
+          status: {}, followup(m) { got.push({ id, text: m.content?.[0]?.text }); }, steer() {}, cancel() {},
+        } : undefined;
+      },
+    },
+    workingDirectory: { ensure: async () => process.cwd() },
+    sandboxPolicy: { resolve: async () => ({ mode: 'danger-full-access' }) },
+    sandbox: { confine: async (a) => ({ argv: a }) },
+    tools: { register(t) { R[t.name] = t; } }, on() { return () => {}; },
+  });
+  mod.default.apply(ctx, { global: 50, perOwner: 50, timeoutMinutes: 120, sweepSeconds: 600, retentionDays: 30 });
+  const dbp = path.join(home, '.dsh', 'background-task-coordinator', 'reg', 'tasks.db');
+  const { DatabaseSync } = await import('node:sqlite');
+  const get1 = (sql, ...a) => { const ro = new DatabaseSync(dbp, { readOnly: true }); const v = ro.prepare(sql).get(...a); ro.close(); return v; };
+  const set = (sql, ...a) => { const w = new DatabaseSync(dbp); w.prepare(sql).run(...a); w.close(); };
+
+  const victimA = { agent: { id: 'owner-A', session: { id: 'owner-A' } } };
+  const attackerB = { agent: { id: 'attacker-B', session: { id: 'attacker-B' } } };
+
+  // 10.1 越权：别人的任务不许登记委派（0.2.0 漏 ownedBy，攻击者能劫持 + 刷走 pending）
+  let r = await R.task_create.execute({ type: 'subagent', title: 'victim', objective: 'x' }, victimA);
+  const tV = r.text.match(/taskId=([\w-]+)/)?.[1];
+  // 受害者在排队一条私密指令
+  await R.task_append_message.execute({ taskId: tV, content: 'SECRET_TOKEN=xyz123' }, victimA);
+  r = await R.task_register_delegation.execute({ taskId: tV, agentId: 'ag-evil', sessionId: 'sess-EVIL' }, attackerB);
+  ok('10.1 越权登记委派被拒', !r.ok && r.text.includes('任务不存在'), r.text.slice(0, 40));
+  ok('10.2 受害者的 pending 没被刷给攻击者', !got.some((g) => String(g.text).includes('SECRET')), JSON.stringify(got));
+  ok('10.3 任务仍归原主', get1("SELECT owner_session_id FROM tasks WHERE id=?", tV).owner_session_id === 'owner-A');
+
+  // 10.4 从未绑定的 queued 子代理点取消 → 直接 cancelled（0.2.0 卡在 cancel_requested）
+  r = await R.task_cancel.execute({ taskId: tV, reason: 'never bound' }, victimA);
+  ok('10.4 从未绑定的 queued 子代理取消能落地', /已取消/.test(r.text), r.text.slice(0, 50));
+  ok('10.5 状态是 cancelled 不是 cancel_requested',
+    get1("SELECT status FROM tasks WHERE id=?", tV).status === 'cancelled',
+    get1("SELECT status FROM tasks WHERE id=?", tV).status);
+
+  // 10.6 探活抛异常时 task_list 不崩（0.2.0 会打崩整个工具）
+  r = await R.task_create.execute({ type: 'subagent', title: 'throws', objective: 'x' }, victimA);
+  const tX = r.text.match(/taskId=([\w-]+)/)?.[1];
+  await R.task_register_delegation.execute({ taskId: tX, agentId: 'agX', sessionId: 'sess-VICTIM' }, victimA);
+  set("UPDATE tasks SET native_session_id='sess-VICTIM', status='running' WHERE id=?", tX);
+  let threw = false;
+  try { r = await R.task_list.execute({ all: true }, victimA); } catch { threw = true; }
+  ok('10.6 探活异常时 task_list 不崩', !threw && r?.ok, threw ? '抛异常了' : (r?.text ?? '').split('\n')[0].slice(0, 40));
+  ok('10.7 探活失败不误判成 lost',
+    get1("SELECT status FROM tasks WHERE id=?", tX).status === 'running',
+    get1("SELECT status FROM tasks WHERE id=?", tX).status);
+
+  // 10.8 迁移后的表必须有外键和 CHECK（0.2.0 重建时把两个都丢了）
+  const w = new DatabaseSync(dbp);
+  let orphanBlocked = false;
+  try {
+    w.prepare("INSERT INTO task_messages (message_id,task_id,sender,content,idempotency_key,status,created_at) VALUES (?,?,?,?,?,?,?)")
+      .run('orphan', 'no-such-task', 'user', 'x', 'k-orphan', 'pending', 1);
+  } catch { orphanBlocked = true; }
+  ok('10.8 外键在：孤儿消息插不进去', orphanBlocked);
+
+  let badStatusBlocked = false;
+  try {
+    w.prepare("INSERT INTO task_messages (message_id,task_id,sender,content,idempotency_key,status,created_at) VALUES (?,?,?,?,?,?,?)")
+      .run('bad', tX, 'user', 'x', 'k-bad', 'TOTALLY_BOGUS', 1);
+  } catch { badStatusBlocked = true; }
+  ok('10.9 CHECK 在：非法 status 插不进去', badStatusBlocked);
+  w.close();
+
+  // 10.10 崩在半路不丢消息：探活抛错时那条指令必须留下来（0.2.0 是先删旧行再崩）
+  r = await R.task_create.execute({ type: 'subagent', title: 'keepmsg', objective: 'x' }, victimA);
+  const tK = r.text.match(/taskId=([\w-]+)/)?.[1];
+  // 先排一条 pending，再让探活抛错
+  await R.task_append_message.execute({ taskId: tK, content: 'keep-me', idempotencyKey: 'KM' }, victimA);
+  await R.task_register_delegation.execute({ taskId: tK, agentId: 'agK', sessionId: 'sess-VICTIM' }, victimA);
+  set("UPDATE tasks SET native_session_id='sess-VICTIM', status='running' WHERE id=?", tK);
+  let r2;
+  try { r2 = await R.task_append_message.execute({ taskId: tK, content: 'keep-me', idempotencyKey: 'KM' }, victimA); }
+  catch { r2 = { ok: false, text: '（抛异常）' }; }
+  const kept = get1("SELECT COUNT(*) n FROM task_messages WHERE task_id=? AND idempotency_key='KM'", tK).n;
+  ok('10.10 探活抛错时消息不凭空消失', kept >= 1, `库里 ${kept} 条；返回 ${r2.text.slice(0, 40)}`);
+
+  if (saved.U !== undefined) process.env.USERPROFILE = saved.U;
+  if (saved.H !== undefined) process.env.HOME = saved.H;
+  if (saved.P !== undefined) process.env.DSH_PROFILE_DIR = saved.P;
+  if (saved.L !== undefined) process.env.DSH_COORD_LIMITS = saved.L;
+  rm(home);
+}
+
+// ---------------------------------------------------------------------------
+// 11. 审计 #6：windowsVerbatimArguments 只对 danger-full-access 生效
+//     沙箱包装器给的 argv 必须走正常转义，否则带空格路径被劈开
+// ---------------------------------------------------------------------------
+{
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'v021-vb-'));
+  const saved = { U: process.env.USERPROFILE, H: process.env.HOME, P: process.env.DSH_PROFILE_DIR, L: process.env.DSH_COORD_LIMITS };
+  process.env.USERPROFILE = home; process.env.HOME = home;
+  process.env.DSH_PROFILE_DIR = path.join(home, '.dsh', 'profiles', 'vb');
+  delete process.env.DSH_PROFILE;
+  delete process.env.DSH_COORD_LIMITS;
+
+  // 带空格的目录 + 显式引号：verbatim 开对了才跑得通，开错就 Cannot find module
+  const dirWithSpace = path.join(home, 'has space');
+  fs.mkdirSync(dirWithSpace, { recursive: true });
+  const script = path.join(dirWithSpace, 'ok.cjs');
+  fs.writeFileSync(script, String.raw`process.stdout.write('SANDBOX_PATH_OK\n');`, 'utf8');
+
+  const mk = async (secure) => {
+    const mod = await import(`${ROOT}/index.js?sec=vb${secure ? 's' : 'd'}`);
+    const R = {}, chunks = [];
+    const ctx = mkCtx({
+      logger: { info: () => {} },
+      jobs: {
+        start(spec) { spec.run({ append: (s) => chunks.push(s), updateProgress() {} }); return 'nj'; },
+        get() { return { status: 'running' }; }, readAt() { return { chunks: [] }; }, kill() {}, events: { subscribe() { return () => {}; } },
+      },
+      agents: { get() { return undefined; } },
+      workingDirectory: { ensure: async () => process.cwd() },
+      // secure=true → 走 sandbox.confine 分支（模拟带空格路径的包装器）
+      sandboxPolicy: { resolve: async () => ({ mode: secure ? 'workspace-write' : 'danger-full-access' }) },
+      sandbox: {
+        confine: async (argv) => {
+          // 真实包装器的形态：一个可执行文件 + 若干带空格的参数 + 原文
+          return { argv: [process.execPath, script] };
+        },
+      },
+      tools: { register(t) { R[t.name] = t; } }, on() { return () => {}; },
+    });
+    mod.default.apply(ctx, { global: 20, perOwner: 20, timeoutMinutes: 120, sweepSeconds: 600, retentionDays: 30 });
+    const r = await R.task_create.execute({ type: 'job', title: 'vb', objective: `node "${script}"` },
+      { agent: { id: 's-vb', session: { id: 's-vb' } } });
+    await new Promise((res) => setTimeout(res, 1200));
+    return { r, out: chunks.join('') };
+  };
+
+  const safe = await mk(true);
+  ok('11.1 沙箱分支：带空格路径不被劈开', safe.r.ok && safe.out.includes('SANDBOX_PATH_OK'),
+    JSON.stringify(safe.out.slice(0, 60)));
+
+  const open = await mk(false);
+  ok('11.2 danger-full-access 分支：引号路径仍正常', open.r.ok && open.out.includes('SANDBOX_PATH_OK'),
+    JSON.stringify(open.out.slice(0, 60)));
+
+  if (saved.U !== undefined) process.env.USERPROFILE = saved.U;
+  if (saved.H !== undefined) process.env.HOME = saved.H;
+  if (saved.P !== undefined) process.env.DSH_PROFILE_DIR = saved.P;
+  if (saved.L !== undefined) process.env.DSH_COORD_LIMITS = saved.L;
+  rm(home);
+}
+
+// ---------------------------------------------------------------------------
+// 12. 审计 P1-5 / P3：pending 正文不许截断；job 起来后阶段要推进
+// ---------------------------------------------------------------------------
+{
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'v021-misc-'));
+  const saved = { U: process.env.USERPROFILE, H: process.env.HOME, P: process.env.DSH_PROFILE_DIR, L: process.env.DSH_COORD_LIMITS };
+  process.env.USERPROFILE = home; process.env.HOME = home;
+  process.env.DSH_PROFILE_DIR = path.join(home, '.dsh', 'profiles', 'misc');
+  delete process.env.DSH_PROFILE;
+  delete process.env.DSH_COORD_LIMITS;
+
+  const mod = await import(`${ROOT}/index.js?sec=misc`);
+  const R = {}, got = [];
+  const alive = new Set(['sess-LONG']);
+  const ctx = mkCtx({
+    logger: { info: () => {} },
+    jobs: { start() { return 'nj'; }, get() { return { status: 'running' }; }, readAt() { return { chunks: [] }; }, kill() {}, events: { subscribe() { return () => {}; } } },
+    agents: {
+      get(id) {
+        return alive.has(id) ? { status: {}, followup(m) { got.push(m.content?.[0]?.text); }, steer() {}, cancel() {} } : undefined;
+      },
+    },
+    workingDirectory: { ensure: async () => process.cwd() },
+    sandboxPolicy: { resolve: async () => ({ mode: 'danger-full-access' }) },
+    sandbox: { confine: async (a) => ({ argv: a }) },
+    tools: { register(t) { R[t.name] = t; } }, on() { return () => {}; },
+  });
+  mod.default.apply(ctx, { global: 20, perOwner: 20, timeoutMinutes: 120, sweepSeconds: 600, retentionDays: 30 });
+  const ex = { agent: { id: 's-misc', session: { id: 's-misc' } } };
+  const dbp = path.join(home, '.dsh', 'background-task-coordinator', 'misc', 'tasks.db');
+  const { DatabaseSync } = await import('node:sqlite');
+  const get1 = (sql, ...a) => { const ro = new DatabaseSync(dbp, { readOnly: true }); const v = ro.prepare(sql).get(...a); ro.close(); return v; };
+
+  // 12.1 长指令排队后补投，正文必须完整
+  let r = await R.task_create.execute({ type: 'subagent', title: 'longmsg', objective: 'x' }, ex);
+  const t1 = r.text.match(/taskId=([\w-]+)/)?.[1];
+  const longBody = `${'A'.repeat(1200)}TAIL-MARKER`;
+  await R.task_append_message.execute({ taskId: t1, content: longBody }, ex);
+  const stored = get1("SELECT content FROM task_messages WHERE task_id=?", t1).content;
+  ok('12.1 pending 正文完整入库（不再截 500）', stored.length === longBody.length && stored.endsWith('TAIL-MARKER'),
+    `存了 ${stored.length}/${longBody.length} 字`);
+  await R.task_register_delegation.execute({ taskId: t1, agentId: 'agL', sessionId: 'sess-LONG' }, ex);
+  const delivered = got.find((g) => String(g).includes('TAIL-MARKER'));
+  ok('12.2 补投出去的是完整正文', !!delivered && delivered.length === longBody.length,
+    delivered ? `投了 ${delivered.length} 字` : '没投出去');
+
+  // 12.3 job 起来后阶段要推进到 running
+  r = await R.task_create.execute({ type: 'job', title: 'stage', objective: 'echo hi' }, ex);
+  const t2 = r.text.match(/taskId=([\w-]+)/)?.[1];
+  const st = get1("SELECT status,current_stage FROM tasks WHERE id=?", t2);
+  ok('12.3 job 起来后阶段推进到 running', st.current_stage === 'running', `${st.status} / ${st.current_stage}`);
+
+  if (saved.U !== undefined) process.env.USERPROFILE = saved.U;
+  if (saved.H !== undefined) process.env.HOME = saved.H;
+  if (saved.P !== undefined) process.env.DSH_PROFILE_DIR = saved.P;
+  if (saved.L !== undefined) process.env.DSH_COORD_LIMITS = saved.L;
   rm(home);
 }
 

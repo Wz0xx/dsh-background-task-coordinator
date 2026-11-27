@@ -468,6 +468,44 @@ export function apply(ctx, config) {
   const log = (msg) => logger?.info?.(`[task-coordinator] ${msg}`);
   _log = log; // 模块级函数（migrate 等）也要能打日志
 
+  // -------------------------------------------------------------------------
+  // 统一配置读取（0.2.1）：task_create 的限额、维护循环、保留天数都走这一份。
+  //
+  // 0.2.0 的错：task_create 里另写了一套只读环境变量的 LIMITS，
+  // 和下面那套 LIMITS_READ() 各算各的 —— 于是 cordis.patch.yml 里的 config
+  // 对建任务完全不生效（实测传 {global:1} 仍能建第 2 个，deadlineMinutes 仍落 120）。
+  //
+  // 三层来源，后者盖前者：内置默认 → yml config → DSH_COORD_LIMITS 环境变量。
+  // 环境变量放最后是为了「临时调大试试」不用改 yml 重启。
+  // -------------------------------------------------------------------------
+  const LIMITS_READ = () => {
+    let lim = {
+      global: 5,
+      perOwner: 4,
+      timeoutMinutes: 120,
+      sweepSeconds: 300,
+      retentionDays: 30,
+      ...(PLUGIN_CFG && typeof PLUGIN_CFG === 'object' ? PLUGIN_CFG : {}),
+    };
+    try {
+      const raw = process.env.DSH_COORD_LIMITS;
+      if (raw) lim = { ...lim, ...JSON.parse(raw) };
+    } catch { /* 环境变量坏了用上一层 */ }
+    // 数值必须落地成有限数（审计 P2-8）：yml 里写了 "300" 或字段名写错，
+    // Math.max(1, NaN) 还是 NaN，setInterval(NaN) 会退化成 1ms 死循环。
+    const num = (v, def, min) => {
+      const n = Number(v);
+      return Number.isFinite(n) && n >= min ? n : def;
+    };
+    return {
+      global: num(lim.global, 5, 1),
+      perOwner: num(lim.perOwner, 4, 1),
+      timeoutMinutes: num(lim.timeoutMinutes, 120, 1),
+      sweepSeconds: num(lim.sweepSeconds, 300, 1),
+      retentionDays: num(lim.retentionDays, 30, 0),
+    };
+  };
+
   const INJECTED = new Set(inject);
   const jobsProbe = probeJobs(ctx, INJECTED);
 
@@ -529,7 +567,17 @@ export function apply(ctx, config) {
       // 超了还没绑定，就当失联收掉：既不会误杀刚登记的，也不会永远占着。
       let gone = false;
       if (t.nativeSessionId) {
-        gone = !getAgentHandle(ctx, t);
+        // 必须接住 getAgentHandle 的异常（0.2.1，审计 #1）：
+        // 0.1.10 起它不再把 agents.get 的异常吞成 undefined，而是让它冒出来 ——
+        // 目的是让调用方区分「查不到」和「查询失败」。但这里没接，结果是一条子代理
+        // 的瞬时查询异常会把整个 task_list 打崩。
+        // 探活失败的正确处理是「这轮不下结论」：既不算死（不误杀），也不算活（下轮再试）。
+        try {
+          gone = !getAgentHandle(ctx, t);
+        } catch (e) {
+          log(`探活失败，本轮跳过 ${t.id}：${String(e?.message ?? e).slice(0, 120)}`);
+          continue;
+        }
       } else {
         const born = Number(t.createdAt) || 0;
         const graceMs = LIMITS_READ().timeoutMinutes * 60_000;
@@ -585,29 +633,16 @@ export function apply(ctx, config) {
         const ownerSessionId = String(exec?.agent?.id ?? '') || conversationId;
 
         // ---- 资源治理（任务书表 6 / A11）：创建执行器前原子占位 ----
-        // 限额配置化：DSH_COORD_LIMITS 环境变量可覆盖（JSON：{"global":3,"perOwner":2,"timeoutMinutes":120,"sweepSeconds":300}）
         const d = db();
-        // 数值必须校验：NaN 会让 `length >= NaN` 恒 false（限额直接失效），
-        // sweepSeconds 为 NaN 会让 setInterval 退化成 1ms 死循环（审计 P2-8）。
-        const num = (v, def, min) => {
-          const n = Number(v);
-          return Number.isFinite(n) && n >= min ? n : def;
-        };
         // 默认值取中间档 5/4（2026-11-27 下游补丁反馈 §1）：
         // 原来的 3/2 对「几个目录同时扫 + 构建和测试分头跑」这种天然并行的活偏紧，
         // 撞限之后只能串行，等于回到没用插件之前。重度用户可以用 DSH_COORD_LIMITS 调更大。
-        let LIMITS = { global: 5, perOwner: 4, timeoutMinutes: 120 };
-        try {
-          const raw = process.env.DSH_COORD_LIMITS;
-          if (raw) {
-            const j = JSON.parse(raw);
-            LIMITS = {
-              global: num(j?.global, 5, 1),
-              perOwner: num(j?.perOwner, 4, 1),
-              timeoutMinutes: num(j?.timeoutMinutes, 120, 1),
-            };
-          }
-        } catch { /* 环境变量坏了用默认 */ }
+        //
+        // 0.2.1（审计 #4）：这里原来另写了一套只读环境变量的 LIMITS，
+        // 和 LIMITS_READ() 各算各的 —— 于是 cordis.patch.yml 里的 config
+        // 对建任务完全不生效（实测传 {global:1} 仍能建第 2 个，deadlineMinutes 仍落 120）。
+        // 现在统一走 LIMITS_READ()：内置默认 → yml config → DSH_COORD_LIMITS，只有一条路。
+        const LIMITS = LIMITS_READ();
         // 活动任务只取活动态（走 idx_tasks_status，不再拉全表 500 条内存过滤 —— 审计 P1-4）
         const activeAll = d.listActive([...ACTIVE]);
         if (activeAll.length >= LIMITS.global) {
@@ -725,6 +760,9 @@ export function apply(ctx, config) {
           // 绝不放行裸执行（深度审计 P0-1）。
           // 取服务同样必须走 ctx.get()（同一原因：直取会抛 `without inject`）。
           let argv = null;
+          // 是否让 Node 跳过参数引号转义。只有「我们自己拼的 cmd /d /s /c」那条分支该开；
+          // 沙箱包装器给的 argv 绝不能开（见两处赋值处的注释）。
+          let verbatim = false;
           try {
             // agent 兜底与 cwd 段一致：exec.agent 常为空，退到台账 ownerSessionId 捞。
             const ag = exec?.agent
@@ -751,6 +789,9 @@ export function apply(ctx, config) {
             if (policy.mode === 'danger-full-access') {
               // 显式放行：直接用原始 argv，这是宿主明确允许的
               argv = wrapped;
+              // 只有这条分支才需要 verbatim（见 spawn 处的解释）：
+              // 这是我们自己拼的 `cmd.exe /d /s /c <原文>`，后面那一段必须原样交过去。
+              verbatim = true;
             } else {
               if (typeof sb?.confine !== 'function') {
                 d.updateTaskFields(id, { status: 'failed', errorSummary: 'sandbox.confine 不可用', updatedAt: Date.now(), completedAt: Date.now() });
@@ -762,6 +803,9 @@ export function apply(ctx, config) {
                 return { ok: false, text: `建任务失败：sandbox.confine 没有返回可用 argv，拒绝无沙箱执行。（taskId=${id}）` };
               }
               argv = sandboxed.argv.map(String);
+              // 沙箱包装器的 argv 里常见 `C:\Program Files\...` 这种带空格的绝对路径，
+              // 它**必须**走 Node 的正常引号转义，否则会被劈成多个参数（0.2.1 修）。
+              verbatim = false;
             }
           } catch (e) {
             // 区分两类错误（2026-11-27 下游补丁反馈 §3）：
@@ -795,9 +839,11 @@ export function apply(ctx, config) {
                   // 而 cmd 在 /s 下又会剥一层 —— 两头一夹，objective 里本来正常的
                   // `node "C:\某目录\脚本.js"` 会被拼成字面引号：
                   //   Cannot find module 'C:\...\"C:\某目录\脚本.js"'
-                  // 这不是测试构造的问题，是任何带引号、带空格的命令都会中招。
-                  // windowsVerbatimArguments 让 Node 不再转义，argv 原样进命令行。
-                  windowsVerbatimArguments: process.platform === 'win32',
+                  //
+                  // **但只对 danger-full-access 那条分支生效**（0.2.1 修，审计 #6）：
+                  // sandbox.confine 返回的 argv 里常有 `C:\Program Files\...` 这类带空格路径，
+                  // 跳过转义会把它们劈成多个错误参数。所以按 argv 的来源决定，不无条件开。
+                  windowsVerbatimArguments: process.platform === 'win32' && verbatim,
                   // 非 Windows 上让子进程自成一个进程组，cancel 时才能整组杀干净；
                   // Windows 用 taskkill /T 走进程树，不需要这个。
                   detached: process.platform !== 'win32',
@@ -879,7 +925,10 @@ export function apply(ctx, config) {
             t.nativeId = String(jobId ?? '');
             t.status = 'running';
             t.stage = 'running';
-            d.updateTaskFields(id, { status: 'running', nativeId: t.nativeId, updatedAt: Date.now() });
+            // currentStage 必须一起推进（0.2.1，审计 P3 项）：
+            // 0.2.0 只写了 status='running'，阶段还停在 'creating-executor' ——
+            // task_describe 里那句「阶段：xxx」会一直报一个早就过去的阶段。
+            d.updateTaskFields(id, { status: 'running', currentStage: 'running', nativeId: t.nativeId, updatedAt: Date.now() });
             emitEvent(null, id, 'task.started', 'coordinator', `native=${t.nativeId}`);
             log(`job 启动：${id} → native ${t.nativeId}`);
           } catch (e) {
@@ -1033,9 +1082,12 @@ export function apply(ctx, config) {
           for (const e of evs) lines.push(`  ${new Date(e.createdAt).toLocaleTimeString()} [${e.eventType}] ${e.payload?.note ?? ''}`);
         }
         // Job 输出非消耗读。有主 job 的 get/readAt 受 assertAccess 围栏：
-        // caller 必须等于 owner（task_create 落台账的 owner_session_id）。
-        const rowFull = d.getTask(tid);
-        const caller = rowFull?.ownerSessionId ?? undefined;
+        // caller 必须是**真实的调用者**（0.2.1，审计 P0-3 回归项）。
+        //
+        // 0.2.0 这里用的是 rowFull.ownerSessionId —— 那是「谁创建的」，不是「现在谁在调」。
+        // 等于替别人的任务冒充 owner 去读输出，把 DSH 0.2.2 的 assertAccess 围栏直接穿透了。
+        // 上面已经过了 ownedBy，所以这里 caller 要么是真的调用者，要么拿不到身份（历史兼容）。
+        const caller = own.caller ?? own.owner ?? undefined;
         if (t.type === 'job' && t.nativeId && ctx.jobs?.get) {
           try {
             const jv = ctx.jobs.get(t.nativeId, caller);
@@ -1087,6 +1139,12 @@ export function apply(ctx, config) {
         if (TERMINAL.has(row.status)) {
           return { ok: false, text: `任务已终态（${row.status}），不能再登记委派。要续跑请新建任务。` };
         }
+        // 归属校验（0.2.1，审计 P0-3 回归项）：0.2.0 漏了这一条。
+        // 后果比看起来严重：任何会话只要知道 taskId，就能把**别人的**任务绑到自己的
+        // 子代理上，而绑定后的 pending 补投会把别人排队的指令原样投进我的 agent
+        // —— 等于跨会话窃取指令。所有读写台账的工具都必须过这一关。
+        const own = ownedBy(row, exec);
+        if (!own.ok) return { ok: false, text: `任务不存在：${args?.taskId}` };
         const agentName = String(args?.agentId ?? '').trim();
         if (!agentName) return { ok: false, text: 'agentId 不能为空（原生 subagent 工具返回的 agent 名）' };
         // 原生 subagent 工具只回 "started subagent <name>"，拿不到会话 id；
@@ -1226,18 +1284,26 @@ export function apply(ctx, config) {
         if (settled) {
           return { ok: settled.status === 'delivered', text: `幂等命中：指令 ${settled.messageId} 已是 ${settled.status}，本次未重复投递。（idempotencyKey=${checkKey}）` };
         }
-        // 没成的那条：这次要真投，就先把旧记录删掉。
-        // 为什么是删而不是改成 cancelled：幂等键在库里是 (task_id, key) 联合唯一，
-        // 同一 key 只允许一行 —— 留着旧的（哪怕状态已改）照样会撞索引，
-        // 结果是 INSERT 静默失败、消息投出去了但库里没记录（审计 P1-7 的形态）。
-        // 这些行从没投成功过，删掉不丢事实；投递尝试本身已经写在 task_events 里。
-        for (const m of prior) {
-          try {
-            d.deleteMessage(m.messageId);
-          } catch { /* 单条失败不阻塞本次投递 */ }
-        }
+        // 没成的那条：这次要真投，就得先腾出同一个 (task_id, key) 的位置。
+        // 为什么是删而不是改成 cancelled：幂等键在库里是联合唯一，同一 key 只允许一行 ——
+        // 留着旧的（哪怕状态已改）照样会撞索引，结果是 INSERT 静默失败、消息投出去了但库里没记录。
+        //
+        // **但删的时机很关键**（0.2.1，审计 #1 的连带问题）：
+        // 0.2.0 是「进门就删」，然后才去探活。一旦探活抛异常或后续任何一步失败，
+        // 那条旧记录已经没了、新的也没写进去 —— 消息凭空消失。
+        // 改成把删除封装成 mustPurge()，只在**确定要写新行之前**调用，
+        // 探活这类可能失败的动作全部排在它前面。
+        let purged = false;
+        const mustPurge = () => {
+          if (purged) return;
+          purged = true;
+          for (const m of prior) {
+            try { d.deleteMessage(m.messageId); } catch { /* 单条失败不阻塞本次投递 */ }
+          }
+        };
 
         if (t.type === 'job') {
+          mustPurge();
           d.insertMessage({
             messageId: mid,
             taskId: tid,
@@ -1253,11 +1319,15 @@ export function apply(ctx, config) {
           return { ok: false, text: `未投递：background job 不支持 stdin 追加（原生契约如此，不伪装）。指令已记录（${mid}），可排队为任务后续步骤或转交所属 subagent。` };
         }
         if (!t.nativeId) {
+          mustPurge();
           d.insertMessage({
             messageId: mid,
             taskId: tid,
             sender: 'user',
-            content: content.slice(0, 500),
+            // pending 的正文必须**完整**存（0.2.1，审计 P1-5）：
+            // 这条是要在绑定后补投给 agent 的，截到 500 字就等于把指令砍半投出去。
+            // 上限放宽到 16000（远超任何正常指令），只是防超大 payload 撑爆库。
+            content: content.slice(0, 16000),
             idempotencyKey: checkKey,
             status: 'pending',
             channel: 'none',
@@ -1269,8 +1339,37 @@ export function apply(ctx, config) {
         // 真实投递：ctx.agents.get(sessionId) 拿活着的 agent，调 followup / steer。
         // ctx.agents 只按 session id 索引 —— 台账里 nativeId 是 agent 名，必须用 nativeSessionId
         // （没解析出才退回名字，会查不到，那就是如实报不可达，不装作投出去了）。
-        const ag = getAgentHandle(ctx, t);
+        //
+        // 必须接住异常（0.2.1，审计 #1）：0.1.10 起 getAgentHandle 会让 agents.get 的异常
+        // 冒出来。这里不接的话工具直接崩，而且崩在上一步「删掉旧 pending 行」之后 ——
+        // 那条消息就既没投出去也没留记录，凭空消失。
+        let ag = null;
+        let probeErr = null;
+        try {
+          ag = getAgentHandle(ctx, t);
+        } catch (e) {
+          probeErr = e;
+        }
+        if (probeErr) {
+          // 探活本身失败 ≠ agent 不在。如实记成「这次没探成」，状态留 pending 让下次可重试，
+          // 不能标 undeliverable（那会把一条可能投得出去的消息判死）。
+          mustPurge();
+          d.insertMessage({
+            messageId: mid,
+            taskId: tid,
+            sender: 'user',
+            content: content.slice(0, 16000),
+            idempotencyKey: checkKey,
+            status: 'pending',
+            channel: 'none',
+            reason: `探活失败: ${String(probeErr?.message ?? probeErr).slice(0, 140)}`,
+            createdAt: Date.now(),
+          });
+          emitEvent(null, tid, 'task.message_appended', 'model', `probe-failed: ${content.slice(0, 60)}`);
+          return { ok: false, text: `未投递：查询 agent ${t.nativeId} 时出错（${String(probeErr?.message ?? probeErr).slice(0, 140)}）。指令已留为 pending，稍后重试或再调一次。` };
+        }
         if (!ag) {
+          mustPurge();
           d.insertMessage({
             messageId: mid,
             taskId: tid,
@@ -1297,6 +1396,7 @@ export function apply(ctx, config) {
           if (mode === 'next-step' && typeof ag.steer === 'function') ag.steer(message);
           else if (typeof ag.followup === 'function') ag.followup(message);
           else throw new Error('这个 agent 没有 followup/steer');
+          mustPurge();
           d.insertMessage({
             messageId: mid,
             taskId: tid,
@@ -1312,6 +1412,7 @@ export function apply(ctx, config) {
           const sid = t.nativeSessionId || t.nativeId;
           return { ok: true, text: `已投递到 agent ${t.nativeId}${t.nativeSessionId ? `（会话 ${sid}）` : ''}（${mid}，mode=${mode}）。busy 时进收件箱，下一可接收时机处理，不打断当前工具调用。` };
         } catch (e) {
+          mustPurge();
           d.insertMessage({
             messageId: mid,
             taskId: tid,
@@ -1375,19 +1476,49 @@ export function apply(ctx, config) {
             // 会拿 **agent 名字**去查按 session id 索引的注册表 → 恒空 →
             // 把还活着的 subagent 判成已回收、直接落 cancelled。那是误杀。
             const hasRealId = !!t.nativeSessionId;
-            const ag = hasRealId ? getAgentHandle(ctx, t) : undefined;
-            if (ag && typeof ag.cancel === 'function') {
+            // 探活异常要接住（0.2.1，审计 #1）：getAgentHandle 会抛，
+            // 这里不接就整个工具崩，取消动作一个都没做。
+            let ag;
+            let probeErr = null;
+            if (hasRealId) {
+              try {
+                ag = getAgentHandle(ctx, t);
+              } catch (e) {
+                probeErr = e;
+              }
+            }
+            if (probeErr) {
+              // 探活失败 = 不知道死活。不能落 cancelled（那是编造），也不是「没绑定」。
+              // 记 cancel_requested，交给重启对账 / 超时清账收尾，并如实说明。
+              nativeOk = `探活失败（${String(probeErr?.message ?? probeErr).slice(0, 80)}），未能确认原生状态`;
+            } else if (ag && typeof ag.cancel === 'function') {
               ag.cancel({ kind: 'user' }, { keepInbox: true });
               nativeOk = 'agent.cancel(keepInbox)';
             } else if (ag) {
               nativeOk = 'agent 无 cancel 方法，等 subagent/end 确认';
+            } else if (!hasRealId && !t.nativeId) {
+              // **从未绑定**（连 agent 名都没有）：没有任何原生执行单元可中断，
+              // 也没有会到来的 subagent/end —— 以前这里被 `!hasRealId` 抢走，
+              // 结果一个从没登记过的 queued 子代理点取消反而被锁进 cancel_requested
+              // 永不落地（0.2.1，审计 #2）。这种直接收尾，事实清楚：它从来没跑起来过。
+              d.updateTaskFields(tid, {
+                status: 'cancelled',
+                currentStage: 'cancelled',
+                errorSummary: `${reason}（从未绑定原生执行单元，直接收尾）`,
+                updatedAt: Date.now(),
+                completedAt: Date.now(),
+              });
+              emitEvent(null, tid, 'task.cancelled', 'user', reason);
+              settleNotification(null, { id: tid, status: 'cancelled' });
+              return { ok: true, text: `task ${tid} 已取消（从未绑定子代理，无需中断）。` };
             } else if (!hasRealId) {
-              // 没有真 id：探不了，也就不能断定死活。
-              // 但也不该一直挂着 —— 记 cancel_requested，交给重启对账/超时清账收尾，
+              // 有 agent 名字但反查不出会话 id：探不了死活的**已绑定**任务。
+              // 记 cancel_requested，交给重启对账 / 超时清账收尾，
               // 并在文案里说清楚「没探活，别以为已经停了」。
               nativeOk = '未解析出会话 id，未探活（无法确认原生状态）';
             } else {
-              // 根本没绑上 / 原生已回收：没有可中断的对象，直接落终态，别留僵尸（审计 P0-2）。
+              // 已绑定 + 有真 id + 探活成功但查不到 = 原生已回收。
+              // 没有可中断的对象，直接落终态，别留僵尸（审计 P0-2）。
               d.updateTaskFields(tid, {
                 status: 'cancelled',
                 currentStage: 'cancelled',
@@ -1532,27 +1663,51 @@ export function apply(ctx, config) {
       parameters: { type: 'object', additionalProperties: false, properties: {} },
       output: textOut(),
       async execute() {
-        // 直接按名字探：Cordis 的服务不一定出现在 Object.keys(ctx) 上。
+        // 服务一律走 ctx.get() 查（0.2.1，审计 P3 项）。
+        // 0.2.0 这里是 `ctx[k]` 直取：cordis 4.x 对不在 inject 白名单里的服务
+        // （subagents / workingDirectory / sandbox*）**取属性就抛**
+        // `cannot get property "x" without inject`，于是这个诊断工具对自己最该探的
+        // 那几个服务永远只回一行 error —— 探不到任何真实方法面。
         const probe = {};
-        for (const k of ['jobs', 'agents', 'tools', 'subagents']) {
+        const svcOf = (k) => {
+          // inject 过的（jobs/agents/tools）直取没问题，也允许直取；
+          // 其余走 get()。两条都试，取到就用，取不到记原因。
           try {
-            const v = ctx[k];
-            if (!v) {
-              probe[k] = 'undefined';
-              continue;
+            if (typeof ctx.get === 'function') {
+              const viaGet = ctx.get(k);
+              if (viaGet) return { v: viaGet, via: 'ctx.get' };
             }
+          } catch { /* 落到直取 */ }
+          try {
+            const direct = ctx[k];
+            if (direct) return { v: direct, via: 'direct' };
+            return { v: null, via: 'undefined' };
+          } catch (e) {
+            return { v: null, via: `unavailable (${String(e?.message ?? e).slice(0, 60)})` };
+          }
+        };
+        for (const k of ['jobs', 'agents', 'tools', 'subagents', 'workingDirectory', 'sandbox', 'sandboxPolicy']) {
+          const { v, via } = svcOf(k);
+          if (!v) {
+            probe[k] = { via, methods: null };
+            continue;
+          }
+          try {
             const proto = Object.getPrototypeOf(v);
             const names = proto ? Object.getOwnPropertyNames(proto) : [];
-            probe[k] = names.filter((n) => n !== 'constructor').slice(0, 24);
+            probe[k] = {
+              via,
+              methods: names.filter((n) => n !== 'constructor').slice(0, 24),
+            };
           } catch (e) {
-            probe[k] = 'error: ' + String(e).slice(0, 100);
+            probe[k] = { via, methods: `error: ${String(e).slice(0, 80)}` };
           }
         }
         return {
           ok: true,
           text: [
             `jobs 候选：${JSON.stringify(jobsProbe)}`,
-            `直接探：${JSON.stringify(probe, null, 1)}`,
+            `服务探测：${JSON.stringify(probe, null, 1)}`,
           ].join('\n'),
         };
       },
@@ -1813,37 +1968,6 @@ export function apply(ctx, config) {
   }
 
   // -------------------------------------------------------------------------
-  // 超时清账（任务书表 6「任务超时」/ A12 邻近项）：deadlineAt 过点的活动任务，
-  // 先请求取消原生执行器，落 cancel_requested；原生确认（或下次扫描仍无响应）落终态。
-  // 5 分钟一扫，不做高精度定时——任务书要的是「超时先请求取消，等待确认后落终态」。
-  // -------------------------------------------------------------------------
-  const LIMITS_READ = () => {
-    // 三层来源，后者盖前者：内置默认 → cordis.patch.yml 的 config → DSH_COORD_LIMITS 环境变量。
-    // 环境变量放最后是为了「临时调大试试」不用改 yml 重启。
-    let lim = {
-      timeoutMinutes: 120,
-      sweepSeconds: 300,
-      retentionDays: 30,
-      ...(PLUGIN_CFG && typeof PLUGIN_CFG === 'object' ? PLUGIN_CFG : {}),
-    };
-    try {
-      const raw = process.env.DSH_COORD_LIMITS;
-      if (raw) lim = { ...lim, ...JSON.parse(raw) };
-    } catch { /* 环境变量坏了用上一层 */ }
-    // 数值必须落地成有限数（审计 P2-8 的同一类问题）：
-    // yml 里写了 "300"（字符串）或写错字段名，Math.max(1, NaN) 还是 NaN，
-    // setInterval(NaN) 会退化成 1ms 死循环 —— 那比不设还糟。
-    const num = (v, def, min) => {
-      const n = Number(v);
-      return Number.isFinite(n) && n >= min ? n : def;
-    };
-    return {
-      timeoutMinutes: num(lim.timeoutMinutes, 120, 1),
-      sweepSeconds: num(lim.sweepSeconds, 300, 1),
-      retentionDays: num(lim.retentionDays, 30, 0),
-    };
-  };
-  // -------------------------------------------------------------------------
   // 维护循环（0.2.0）：超时清账 + 历史清理。
   //
   // 以前这里只做过期取消，`purgeHistoryOlderThan()` 定义了却**从没被调用**（审计 P1-4）：
@@ -1851,6 +1975,7 @@ export function apply(ctx, config) {
   // 现在同一个定时器里两件事都做：先清超时，再清历史。
   //
   // 保留天数用 DSH_COORD_LIMITS.retentionDays 调（默认 30 天），到 0 表示不清。
+  // 配置读取统一走上面那个 LIMITS_READ（0.2.1 起只有一份）。
   // -------------------------------------------------------------------------
   const sweepTimer = setInterval(() => {
     try {
