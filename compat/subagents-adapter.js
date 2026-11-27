@@ -18,17 +18,16 @@
  * @returns {object|null}
  */
 export function getSubagentsService(ctx) {
+  // 只走 ctx.get()：cordis 4.x 里直取未 inject 的属性会抛
+  // `cannot get property "subagents" without inject`，而 subagents 不在本插件的
+  // inject 列表里（也不能加 —— 加了整个插件不启动，见 cwd 缺陷报告 §3.4）。
   try {
     if (typeof ctx?.get === 'function') {
       const viaGet = ctx.get('subagents');
       if (viaGet) return viaGet;
     }
-  } catch { /* ctx.get 不存在或不认这个键 */ }
-  try {
-    return ctx?.subagents ?? null;
-  } catch {
-    return null;
-  }
+  } catch { /* 服务不存在或宿主不认这个键 */ }
+  return null;
 }
 
 /**

@@ -331,7 +331,11 @@ function settleNotification(_dbRef, t) {
   const key = `notice:${t.id}:${t.status}`;
   const claimed = db().claimIdempotency('notice', key, Date.now());
   if (!claimed) return; // 已入过账
-  emitEvent(null, t.id, 'task.notified', 'notifier', `终态 ${t.status} 通知已入账（原生通道送达）`);
+  // 措辞必须准确（深度审计 P2-9）：这里只写幂等账 + 事件流水，**不投递任何消息**。
+  // job/subagent 正常结束靠 DSH 原生通道回前台；但 lost 这类协调器自产的终态
+  // 没有任何原生事件，前台实际收不到东西。
+  // 0.1.7 及以前这里写「通知已入账（原生通道送达）」—— 那是假的，已改。
+  emitEvent(null, t.id, 'task.notified', 'notifier', `终态 ${t.status} 已记账（仅台账；本插件不主动投递消息）`);
 }
 
 // ---------------------------------------------------------------------------
@@ -547,44 +551,66 @@ export function apply(ctx) {
           d.updateTaskFields(id, { status: 'starting', currentStage: 'creating-executor', updatedAt: Date.now() });
           t.status = 'starting';
           t.stage = 'creating-executor';
-          // cwd：会话工作目录（ctx.workingDirectory 是宿主的每会话目录真源）。
-          // 取不到就如实拒绝——绝不落 DSH 进程目录（反馈第 2 条）。
-          // sandbox 对齐：非 danger-full-access 会话必须过 ctx.sandbox.confine（反馈第 1 条），
-          // confine 抛错/被拒 = 会话不允许自由 shell，如实拒绝，绝不绕过。
+          // cwd：会话工作目录（workingDirectory 是宿主的每会话目录真源）。
+          // 取不到就如实拒绝——绝不落 DSH 进程目录。
+          //
+          // 必须用 ctx.get() 查询，不能用 ctx.workingDirectory 直取：
+          // cordis 4.x 的 Proxy get trap 在属性不在 inject 白名单里时**直接抛错**
+          // （`cannot get property "x" without inject`），抛在「取属性」这一步，
+          // 光加 ?. 救不了 —— 而这句 catch 会把错吞掉，cwd 恒为 null，
+          // 于是 job 在 0.2.2 上 100% 建不起来（2026-11-27 cwd 缺陷报告）。
+          // 也不能往 inject 里加：加了 workingDirectory 会让整个插件不启动（报告 3.4 实测）。
           const firstLine = objective.split('\n', 1)[0].trim();
           const parts = firstLine.split(/\s+/);
+          // 可选服务查询：取不到返回 undefined，不抛。
+          const svc = (name) => {
+            try {
+              return typeof ctx.get === 'function' ? ctx.get(name) : undefined;
+            } catch { return undefined; }
+          };
           let cwd = null;
+          let cwdErr = null;
           try {
             const ag = exec?.agent ?? null;
-            if (ag) cwd = await ctx.workingDirectory?.ensure?.(ag, undefined) ?? null;
-          } catch { /* ensure 失败按无 cwd 处理 */ }
+            const wd = svc('workingDirectory');
+            if (ag && wd && typeof wd.ensure === 'function') cwd = await wd.ensure(ag, undefined) ?? null;
+          } catch (e) { cwdErr = e; }
           if (!cwd) {
-            d.updateTaskFields(id, { status: 'failed', errorSummary: 'working directory unavailable', updatedAt: Date.now(), completedAt: Date.now() });
-            return { ok: false, text: `建任务失败：拿不到本会话的工作目录（cwd），拒绝落 DSH 进程目录跑命令。（taskId=${id}）` };
+            // 把「为什么」写进文案，别只说「拿不到」（报告 4.4）：
+            // 下一个人一眼能看到真正原因，不用去猜宿主管不管。
+            const why = cwdErr?.message
+              ? String(cwdErr.message).slice(0, 160)
+              : 'workingDirectory 服务不可用或未绑定工作目录';
+            d.updateTaskFields(id, { status: 'failed', errorSummary: `working directory unavailable: ${why}`, updatedAt: Date.now(), completedAt: Date.now() });
+            return { ok: false, text: `建任务失败：拿不到本会话的工作目录（cwd）——原因：${why}。（taskId=${id}）` };
           }
           const wrapped = process.platform === 'win32'
             ? ['cmd.exe', '/d', '/s', '/c', firstLine]
             : ['bash', '-c', firstLine];
           // sandbox 对齐必须是 fail-closed：拿不到策略、confine 不可用、返回空 —— 一律拒绝，
-          // 绝不放行裸执行（issue #1 之后的深度审计 P0-1）。
+          // 绝不放行裸执行（深度审计 P0-1）。
+          // 取服务同样必须走 ctx.get()（同一原因：直取会抛 `without inject`）。
           let argv = null;
           try {
             const ag = exec?.agent ?? null;
-            const policy = ag ? await ctx.sandboxPolicy?.resolve?.({ session: ag.session }) : null;
+            const sbp = svc('sandboxPolicy');
+            const sb = svc('sandbox');
+            const policy = (ag && sbp && typeof sbp.resolve === 'function')
+              ? await sbp.resolve({ session: ag.session })
+              : null;
             if (!policy) {
-              // 没有策略 = 不知道该怎么限制 → 拒绝，而不是当成 allow
               d.updateTaskFields(id, { status: 'failed', errorSummary: 'sandbox 策略不可解析', updatedAt: Date.now(), completedAt: Date.now() });
-              return { ok: false, text: `建任务失败：拿不到本会话的沙箱策略（sandboxPolicy.resolve 无结果），拒绝无沙箱执行。（taskId=${id}）` };
+              return { ok: false, text: `建任务失败：拿不到本会话的沙箱策略（sandboxPolicy 服务不可用，或无返回），拒绝无沙箱执行。（taskId=${id}）` };
             }
             if (policy.mode === 'danger-full-access') {
               // 显式放行：直接用原始 argv，这是宿主明确允许的
               argv = wrapped;
             } else {
-              if (typeof ctx.sandbox?.confine !== 'function') {
+              if (typeof sb?.confine !== 'function') {
                 d.updateTaskFields(id, { status: 'failed', errorSummary: 'sandbox.confine 不可用', updatedAt: Date.now(), completedAt: Date.now() });
                 return { ok: false, text: `建任务失败：会话策略是 ${policy.mode} 但宿主没有 sandbox.confine，拒绝无沙箱执行。（taskId=${id}）` };
               }
-              const sandboxed = await ctx.sandbox.confine(wrapped, policy);
+              const sandboxed = await sb.confine(wrapped, policy);
               if (!Array.isArray(sandboxed?.argv) || !sandboxed.argv.length) {
                 d.updateTaskFields(id, { status: 'failed', errorSummary: 'sandbox.confine 返回空 argv', updatedAt: Date.now(), completedAt: Date.now() });
                 return { ok: false, text: `建任务失败：sandbox.confine 没有返回可用 argv，拒绝无沙箱执行。（taskId=${id}）` };
@@ -1299,9 +1325,12 @@ export function apply(ctx) {
       'agent.get': { status: has(() => typeof ctx.agents?.get === 'function'), required: true },
       'subagent.resolve_name': { status: subCaps.resolveName, required: false },
       'subagent.list_children': { status: subCaps.listChildren, required: false },
-      'sandbox.confine': { status: has(() => typeof ctx.sandbox?.confine === 'function'), required: false },
-      'sandbox.policy': { status: has(() => typeof ctx.sandboxPolicy?.resolve === 'function'), required: false },
-      'working_directory': { status: has(() => typeof ctx.workingDirectory?.ensure === 'function'), required: false },
+      // 这三项必须走 ctx.get()：直取会在 cordis 4.x 抛 `without inject`，
+      // has() 的 try/catch 会把错吞掉，于是自检恒报 unsupported——
+      // 等于这行字本身就是那个 bug 的另一面（cwd 缺陷报告 §3.3）。
+      'sandbox.confine': { status: has(() => typeof ctx.get?.('sandbox')?.confine === 'function'), required: false },
+      'sandbox.policy': { status: has(() => typeof ctx.get?.('sandboxPolicy')?.resolve === 'function'), required: false },
+      'working_directory': { status: has(() => typeof ctx.get?.('workingDirectory')?.ensure === 'function'), required: true },
       'system_prompt.section': { status: has(() => typeof ctx.systemPrompt?.section === 'function'), required: false },
     };
 
@@ -1428,15 +1457,23 @@ export function apply(ctx) {
       // A07 会合规则：cancel_requested 状态下收到原生结束事件，无论 stopReason 是什么
       // （常见 aborted/aborted:true，不含 cancel 字样），都落 cancelled——
       // 协调器自己请求过取消，结束就是确认，事实链完整。
-      // 其余情况才按 stopReason 推断：含 cancel 落 cancelled；含 fail/error/abort 落 failed。
-      const cancelled = t.status === 'cancel_requested' || /cancel/i.test(raw);
-      const failed = !cancelled && /fail|error|abort/i.test(raw);
-      // cancel_requested 收到原生取消确认 → cancelled（两个状态的会合点，任务书表 5）
+      //
+      // 其余情况不能「不匹配失败就算成功」（深度审计 P2-2）：
+      // 0.1.7 及以前只认 cancel/fail/error/abort，其余一律 succeeded ——
+      // max_turns / timeout / interrupted / budget_exceeded / 空串 全都会落成「成功」，
+      // 那是假的。现在改成白名单：只有明确正常的结束词才判 succeeded，其余一律 failed
+      // 并把原始 stopReason 写进 errorSummary，让人能看出到底怎么停的。
+      const cancelled = t.status === 'cancel_requested' || /cancel|abort/i.test(raw);
+      // 明确表示「正常收尾」的 stopReason（不同宿主/版本用词不一，取常见集合）
+      const OK_REASONS = /^(completed|end_turn|stop|stop_sequence|success|succeeded|done)$/i;
+      const looksOk = OK_REASONS.test(raw.trim());
+      const failed = !cancelled && !looksOk;
       const status = cancelled ? 'cancelled' : failed ? 'failed' : 'succeeded';
       d.updateTaskFields(t.id, {
         status,
         currentStage: 'settled',
-        errorSummary: failed ? raw.slice(0, 200) : cancelled ? (t.errorSummary ?? '执行器确认停止') : undefined,
+        // 失败的把原始 stopReason 留下来，别只说「失败了」
+        errorSummary: failed ? `end: ${raw || '(空 stopReason)'}`.slice(0, 200) : (cancelled ? (t.errorSummary ?? '执行器确认停止') : undefined),
         resultSummary: !failed && !cancelled ? '子代理已结束（原生 subagent/end）' : undefined,
         updatedAt: Date.now(),
         completedAt: Date.now(),
