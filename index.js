@@ -1104,6 +1104,21 @@ export function apply(ctx, config) {
           // 沙箱要求的环境变量（sandbox.confine 的 env，可选）。
           // 0.2.3 起透传：只吃 argv 不吃 env 是半套隔离。
           let sandboxedEnv = null;
+          // 0.2.10（2026-11-28 装机反馈 Bug 1）：沙箱分支的命令本体改走环境变量。
+          //
+          // 问题：`verbatim` 一个布尔值要同时满足两个矛盾需求 ——
+          //   ① 沙箱分支需要 false：confine 返回的 argv 里有 `C:\Program Files\...` 带空格路径，
+          //      必须让 Node 正常转义，否则被劈成多个参数。
+          //   ② cmd 命令段需要 true：objective 里的 `"` 必须原样交给 cmd，
+          //      否则 Node 按 MSVC 规则转义成 `\"`，而 cmd 的 /c 余下部分不按那套解析。
+          // 结果：沙箱分支下 `echo "a b"` 输出 `\"a b\"`，`powershell -Command "..."` 只回显不执行。
+          //
+          // 解法：命令本体不上命令行，走环境变量；命令行上只留一个不含空格/引号的占位符。
+          // 这样 verbatim 仍然是 false（保护带空格路径），引号问题从根上消失。
+          // 实测（草稿/q-verbatim.mjs）：verbatim=false + 原文 → `\"quoted ok\"`；
+          //                                verbatim=true + 外包引号 → `"quoted ok"`（正确）。
+          const JOB_CMD_ENV = 'COORD_JOB_CMD';
+          let jobCmdViaEnv = null;   // 非 null 时表示命令本体走环境变量
           try {
             // agent 兜底与 cwd 段一致：exec.agent 常为空，退到台账 ownerSessionId 捞。
             const ag = exec?.agent
@@ -1152,6 +1167,30 @@ export function apply(ctx, config) {
               // 沙箱包装器的 argv 里常见 `C:\Program Files\...` 这种带空格的绝对路径，
               // 它**必须**走 Node 的正常引号转义，否则会被劈成多个参数（0.2.1 修）。
               verbatim = false;
+              // 0.2.10（装机反馈 Bug 1）：命令本体改走环境变量，绕开 verbatim 的两难。
+              //
+              // 只在这种形状上动手：confine 返回的末尾是 `cmd.exe /d /s /c <命令文本>`。
+              // 判定刻意写宽（允许 cmd.exe 或 cmd、可带引号、大小写不敏感），
+              // 因为 confine 的实现细节不该被我猜死；匹配不上就原样放行，不做任何改变
+              // —— 那是「不确定就不动」，比猜错强。
+              if (process.platform === 'win32' && argv.length >= 5) {
+                // 位置：argv 形如 [cmd.exe, /d, /s, /c, <命令文本>]
+                //   length-5 = cmd.exe    length-4 = /d
+                //   length-3 = /s         length-2 = /c       length-1 = 命令文本
+                // 之前写成 length-4 取 exe，端到端跑出来 confine 的 argv 是 5 段，
+                // 于是 exe 取到了 '/d'、判定不成立，修复静默失效（草稿/q-e2e-quote.mjs 抓到的）。
+                const exe = String(argv[argv.length - 5]).replace(/^"+|"+$/g, '');
+                const flagD = String(argv[argv.length - 4]).toLowerCase();
+                const flagS = String(argv[argv.length - 3]).toLowerCase();
+                const flagC = String(argv[argv.length - 2]).toLowerCase();
+                if (/^cmd(\.exe)?$/i.test(exe) && (flagD === '/d' || flagD === '/q') && flagS === '/s' && flagC === '/c') {
+                  // 把最后一段（命令本体）替换成占位符，真身进环境变量。
+                  // 占位符刻意不用引号、不含空格：verbatim=false 下它也不会被转义。
+                  argv[argv.length - 1] = `%${JOB_CMD_ENV}%`;
+                  jobCmdViaEnv = firstLine;
+                  log(`沙箱分支：命令本体改走环境变量 ${JOB_CMD_ENV}（规避 cmd 引号转义）`);
+                }
+              }
               // 透传沙箱要求的环境变量（0.2.3，Gemini 补丁采纳）。
               // sandbox.confine() 的契约里可以带 env —— 那通常是沙箱自己设的隔离变量
               // （HOME/TMPDIR/PATH 重定向之类的）。只吃 argv 不吃 env 等于半套隔离：
@@ -1202,7 +1241,13 @@ export function apply(ctx, config) {
                   // 0.2.4：对齐 DSH 原生 scrubbedParentEnv()，过滤宿主凭据类环境变量（KEY/PASSWORD/SECRET/TOKEN/CREDENTIAL）
                   // 与 DSH_* 内部变量；不再把未过滤的完整 process.env 继承或铺底到子进程中。
                   // 若 sandbox.confine 返回了显式 env，则叠加在已过滤的父环境之上。
-                  env: sandboxedEnv ? { ...scrubbedParentEnv(), ...sandboxedEnv } : scrubbedParentEnv(),
+                  //
+                  // 0.2.10：jobCmdViaEnv 非 null 时（沙箱分支走环境变量），命令本体追加在最后
+                  // —— 覆盖在沙箱 env 之上，因为这是本次执行的指令，不该被隔离变量遮掉。
+                  // 变量名不能以 DSH_ 开头：scrubbedParentEnv() 会把 DSH_* 全滤掉（实测踩过）。
+                  env: jobCmdViaEnv !== null
+                    ? { ...scrubbedParentEnv(), ...(sandboxedEnv ?? {}), [JOB_CMD_ENV]: jobCmdViaEnv }
+                    : (sandboxedEnv ? { ...scrubbedParentEnv(), ...sandboxedEnv } : scrubbedParentEnv()),
                   // 非 Windows 上让子进程自成一个进程组，cancel 时才能整组杀干净；
                   // Windows 用 taskkill /T 走进程树，不需要这个。
                   detached: process.platform !== 'win32',
@@ -1234,8 +1279,14 @@ export function apply(ctx, config) {
                     if (s) { job.append(s, { channel: 'stderr' }); bump(); }
                   });
                 }
+                // 0.2.10：cancel() 写入、done 的 close 处理器读取的闭包标记。
+                // 放在 return 之前声明，两个闭包共享同一个变量。
+                let cancelMarker = null;
                 return {
                   cancel() {
+                    // 必须在动手杀之前先标记：taskkill 可能极快，close 可能在
+                    // 同步路径上就排到队列前面 —— 标记晚了会漏。
+                    try { cancelMarker?.(); } catch { /* 标记失败不影响杀 */ }
                     // 必须连子孙一起杀：只杀父 shell 的话，它下面的真进程会变孤儿继续跑，
                     // 台账标了 cancelled、进程还在（审计 P1-2 ③）。
                     //
@@ -1265,6 +1316,18 @@ export function apply(ctx, config) {
                     } catch { /* 已退出 */ }
                   },
                   done: new Promise((resolve) => {
+                    // 0.2.10（装机反馈 Bug 2）：用户主动取消 ≠ 作业失败。
+                    //
+                    // 实测（草稿/q-jobkill.mjs）：taskkill /T /F 杀掉 cmd.exe 后，
+                    // close 给的是 code=1、signal=null —— 不是 killed。
+                    // 于是 producer 报 { status:'failed', detail:'exit 1' }，
+                    // 宿主 jobs 原样采纳，settled 事件里 job.status='failed'，
+                    // 台账就落下 task.failed / exit 1。用户刚点了取消，看到的却是「失败」。
+                    //
+                    // 修法分两层，这里是最根本的一层：本进程自己下发过 cancel 时，
+                    // producer 直接报 'killed'（宿主 JobStatus 的原生枚举里有这个词），
+                    // 让上游从源头就拿到正确事实，而不是靠下游猜。
+                    let cancelRequested = false;
                     // spawn 失败时 close 不一定触发（进程根本没起来），done 会永久悬空。
                     // 监听 error 单独收口，避免任务永远卡在 running（审计 P1-2）。
                     child.on('error', (e) => {
@@ -1281,14 +1344,25 @@ export function apply(ctx, config) {
                           if (tail) job.append(tail, { channel: ch });
                         } catch { /* 尾巴冲不出来就丢，不影响结算 */ }
                       }
+                      // 退出码/信号照样写进 detail —— 事实不能丢，
+                      // 只是状态归「取消」而不是「失败」。
+                      const how = signal ? `killed by ${signal}` : `exit ${code}`;
+                      if (cancelRequested) {
+                        resolve({ status: 'killed', detail: how });
+                        return;
+                      }
                       if (signal) {
-                        resolve({ status: 'failed', detail: `killed by ${signal}` });
+                        resolve({ status: 'failed', detail: how });
                         return;
                       }
                       resolve(code === 0
                         ? { status: 'completed' }
-                        : { status: 'failed', detail: `exit ${code}` });
+                        : { status: 'failed', detail: how });
                     });
+                    // 把「本进程下发过取消」这个事实交给 cancel() 写。
+                    // 用闭包变量而不是查台账：这里是执行层，不该去读台账
+                    //（台账是投影，它可能落后；而「我按过取消键」这件事在执行层是确定的）。
+                    cancelMarker = () => { cancelRequested = true; };
                   }),
                 };
               },
@@ -2657,6 +2731,73 @@ export function apply(ctx, config) {
     log(`subagent/end 订阅失败：${String(e).slice(0, 160)}`);
   }
 
+  // -------------------------------------------------------------------------
+  // 补丁 C（0.2.11）：订阅 agent/disposed —— 被外部销毁时立刻收敛台账。
+  //
+  // 为什么需要：上面 2673 行的注释许诺了 agent/status 和 agent/disposed 两个事件，
+  // 但从 0.1.x 到 0.2.10 只实现了 subagent/end 一个。子代理被外部销毁（父会话关闭、
+  // 归档、drain、宿主清理）时收不到 subagent/end，台账就一直 running 占配额，
+  // 只能等用户手动调两次 task_list 靠 miss 计数落 lost。
+  //
+  // 契约（cordis inspect 实测）：
+  //   'agent/disposed'(payload: { agent }) —— agent.id 就是 SessionId，emit 模式。
+  //
+  // scope 订阅会不会收不到？去查了 dsh-scope:327-338：
+  //   scopeTarget 的过滤是 `if (tag === void 0) return true;` —— 未打 scope 标记的
+  //   监听器全局放行。插件顶层 ctx.on 就属于这一类。
+  //   本机实证：task-mwwaq4jb-n5yv 的终态 note 是 `completed`（subagent/end 的
+  //   stopReason 原文），证明插件级 ctx.on('subagent/end') 真能跨 scope 收到事件；
+  //   agent/disposed 走同一套 carrier（subagent:2994 scopeTarget(this, parent)）。
+  //
+  // 边界（写进 README）：
+  //   · 只覆盖 subagent，不覆盖 job（job 没有 agent 生命周期）
+  //   · 从没解析出 nativeSessionId 的任务匹配不上，仍靠 sweep 兜底
+  //   · 所以它是改善，不是探活的替代
+  // -------------------------------------------------------------------------
+  try {
+    const offDisposed = ctx.on('agent/disposed', (payload) => {
+      const sid = payload?.agent?.id;
+      if (!sid) return;
+      const d = db();
+      let t = null;
+      try {
+        t = d.findActiveByNative(String(sid), [...ACTIVE], 'subagent');
+      } catch (e) {
+        log(`agent/disposed 查台账失败（不阻塞）：${String(e?.message ?? e).slice(0, 120)}`);
+        return;
+      }
+      // 没匹配上就安静走开：可能不是本插件管的子代理，或从没绑定过。
+      // 这里不写 earlyEnds —— 那是给 subagent/end 的秒结竞态用的；
+      // disposal 之后不会再有绑定，缓存没意义。
+      if (!t) return;
+
+      const wasCancel = t.status === 'cancel_requested';
+      const terminal = wasCancel ? 'cancelled' : 'lost';
+      const why = wasCancel
+        ? 'agent/disposed：协调器请求过取消，销毁即确认'
+        : 'agent/disposed：原生已销毁但没收到 subagent/end';
+
+      d.updateTaskFields(t.id, {
+        status: terminal,
+        currentStage: 'settled',
+        errorSummary: terminal === 'cancelled'
+          ? (t.errorSummary ?? why)
+          : why,
+        updatedAt: Date.now(),
+        completedAt: Date.now(),
+      });
+      emitEvent(null, t.id, terminal === 'cancelled' ? 'task.cancelled' : 'task.lost', 'executor', why);
+      // agent/disposed 没有原生通知通道（不像 subagent/end 会自己回到前台），
+      // 所以这里必须自己投一条，否则用户永远不知道任务结束了。
+      settleNotification(null, { id: t.id, status: terminal, ownerSessionId: t.ownerSessionId, title: t.title, errorSummary: why }, { selfProduced: true });
+      log(`结算（agent/disposed）：${t.id} → ${terminal}`);
+    });
+    if (typeof offDisposed === 'function') disposers.push(offDisposed);
+    log('已订阅 agent/disposed');
+  } catch (e) {
+    log(`agent/disposed 订阅失败（不阻塞）：${String(e).slice(0, 160)}`);
+  }
+
 
   // 结算通知投递（V5）：ctx.jobs 结算订阅，回收终态并带通知账。
   try {
@@ -2673,6 +2814,16 @@ export function apply(ctx, config) {
         const t = d.findActiveByNative(String(jobId), [...ACTIVE], 'job');
         if (!t || !ACTIVE.has(t.status)) return;
         const terminal =
+          // 0.2.10（装机反馈 Bug 2，第二层）：A07 会合规则的 job 版本。
+          //
+          // subagent 那边早有这条（settleFromSubagentEnd: `t.status === 'cancel_requested' || ...`），
+          // job 这边一直缺 —— 于是「用户主动取消」被记成「作业失败」。
+          //
+          // 两层修：producer 端已经尽力报 'killed'（见 run() 里的 cancelMarker），
+          // 但宿主版本不同、或 kill 的原生实现变化时，仍可能只给 failed/exit 1。
+          // 所以这里再按台账事实折一次：我们请求过取消，结束就是确认。
+          // 事实链完整，不算编造 —— errorSummary 里照样保留原始 detail（退出码）。
+          t.status === 'cancel_requested' ? 'cancelled' :
           st === 'completed' ? 'succeeded' :
           st === 'failed' ? 'failed' :
           st === 'killed' ? 'cancelled' : null;
@@ -2733,8 +2884,10 @@ export function apply(ctx, config) {
         // 所以这里对 subagent 追一次探活：原生已不在就直接落 lost，别等一个不会来的事件。
         if (t.type === 'subagent' && t.nativeSessionId) {
           let gone = false;
+          let handle = null;
           try {
-            gone = !getAgentHandle(ctx, t);
+            handle = getAgentHandle(ctx, t);
+            gone = !handle;
           } catch { gone = false; /* 探不动就别下结论 */ }
           if (gone) {
             const errMsg = `已超 deadline（${LIMITS_READ().timeoutMinutes} 分钟），且原生 subagent 已不在`;
@@ -2749,6 +2902,54 @@ export function apply(ctx, config) {
             settleNotification(null, { id: t.id, status: 'lost', ownerSessionId: t.ownerSessionId, title: t.title, errorSummary: errMsg }, { selfProduced: true });
             changed += 1;
             continue;
+          }
+          // 补丁 D（0.2.11）：原生还活着 —— 之前这里什么都不做，只等一个可能不会来的
+          // subagent/end，任务就一直卡在 cancel_requested（issue #1 A4 的真形态）。
+          //
+          // 现在补一次真取消。**必须是 keepInbox: false**：
+          //   · cancel 走 agent-loop:815-821，keepInbox=false 时无条件 inbox.clear()
+          //   · clear → splice → mutate(discardRemoved=true) → emit 'agent/inbox/discarded'
+          //     （agent-loop:93-96 / 159-161 / 205）
+          //   · subagent 在 1860-1862 订阅了这个事件 → wakeSettlement → wake(activation)
+          //     → poke.resolve() → settlementState 被重算 → 判 ready → 发 subagent/end
+          // 用 true 就退回「等 poke」的死等（interruptByParent 走的正是这条）。
+          //
+          // 副作用要如实记：排队的 task_append_message 会一起被清掉，
+          // 所以 errMsg 里带丢弃条数，避免用户以为指令送到了。
+          if (t.status !== 'cancel_requested') {
+            try {
+              // 排队中（未投递）的指令条数：cancel(keepInbox:false) 会把它们一起清掉，
+              // 所以要如实报出来，别让用户以为指令送到了。
+              // 用现成的 listPendingMessages（database.js:684），不新加方法。
+              const pendingCount = (() => {
+                try {
+                  return Number(d.listPendingMessages?.(t.id)?.length ?? 0);
+                } catch { return 0; }
+              })();
+              if (typeof handle?.cancel === 'function') {
+                handle.cancel({ kind: 'user' }, { keepInbox: false });
+                const errMsg = `已超 deadline（${LIMITS_READ().timeoutMinutes} 分钟），已下发真取消（keepInbox=false）`
+                  + (pendingCount > 0 ? `，丢弃 ${pendingCount} 条未投递指令` : '');
+                d.updateTaskFields(t.id, {
+                  status: 'cancel_requested',
+                  currentStage: 'deadline-exceeded',
+                  errorSummary: errMsg,
+                  updatedAt: Date.now(),
+                });
+                emitEvent(null, t.id, 'task.cancel_requested', 'coordinator',
+                  `deadline 超时，补下发 ag.cancel(keepInbox:false)` + (pendingCount > 0 ? `，丢弃 ${pendingCount} 条` : ''));
+                log(`超时清账：${t.id} 补下发 ag.cancel（原状态 ${t.status} → cancel_requested）`);
+                changed += 1;
+                // 必须 continue：否则会掉进下面 2967 行的通用分支，
+                // 把上面写好的 errorSummary（含「丢弃 N 条」）覆盖成笼统的「已请求取消」。
+                // 这个是实测发现的（草稿/q-e2e-timeout-cancel.mjs）：补丁 D 生效了，
+                // 但摘要被后一段覆盖，用户看不到丢弃了几条指令。
+                continue;
+              }
+            } catch (e) {
+              // 取消下发失败不阻塞：下一轮 or agent/disposed 还会收
+              log(`超时清账：${t.id} 补取消失败（不阻塞）：${String(e?.message ?? e).slice(0, 120)}`);
+            }
           }
         } else if (t.type === 'subagent' && !t.nativeSessionId && (!t.nativeId || t.status === 'cancel_requested')) {
           // 0.2.4：未绑定（!nativeId）或「已绑定但未解析出会话 id 且已进入 cancel_requested」的超时 subagent，

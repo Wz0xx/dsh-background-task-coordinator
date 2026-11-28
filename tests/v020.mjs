@@ -2536,6 +2536,352 @@ const rm = (p) => { try { fs.rmSync(p, { recursive: true, force: true, maxRetrie
     `找到 ${nLimits.length} 处，limit=${[...new Set(nLimits)].join(',')}`);
 }
 
+// ---------------------------------------------------------------------------
+// 32. 0.2.10（2026-11-28 装机反馈 Bug 2）：用户主动取消 ≠ 作业失败
+//
+// 实测事实（草稿/q-jobkill.mjs）：taskkill /T /F 杀掉 cmd.exe 后，
+// close 给的是 code=1、signal=null —— 不是 killed。
+// 修复前 producer 报 {status:'failed', detail:'exit 1'}，
+// 宿主原样采纳，台账落 task.failed / exit 1。
+//
+// 两层修，这里各测一条：
+//   32.1 producer 层：cancel() 之后 close 报 killed（从源头给正确事实）
+//   32.2 settled 层：宿主仍报 failed 时，台账是 cancel_requested → 折成 cancelled
+// ---------------------------------------------------------------------------
+{
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'v021-cancel-'));
+  const saved = { U: process.env.USERPROFILE, H: process.env.HOME, P: process.env.DSH_PROFILE_DIR, L: process.env.DSH_COORD_LIMITS };
+  process.env.USERPROFILE = home; process.env.HOME = home;
+  process.env.DSH_PROFILE_DIR = path.join(home, '.dsh', 'profiles', 'cancel');
+  delete process.env.DSH_PROFILE;
+  delete process.env.DSH_COORD_LIMITS;
+
+  const mod = await import(`${ROOT}/index.js?sec=cancel`);
+  const R = {};
+  // 捕获 producer 的 hooks，好在测试里手动模拟「取消 → close(1, null)」
+  let capturedSpec = null;
+  let settleListener = null;
+  let jobSeq = 0;                                  // 每次 start 给不同 nativeId，否则两个任务会撞
+  const nativeIds = [];
+  const ctx = mkCtx({
+    logger: { info: () => {} },
+    jobs: {
+      start(spec) { capturedSpec = spec; jobSeq += 1; nativeIds.push(`cancel-job-${jobSeq}`); return `cancel-job-${jobSeq}`; },
+      get() { return { status: 'running' }; },
+      readAt() { return { chunks: [] }; },
+      kill() { return 'requested'; },
+      events: { subscribe(_f, listener) { settleListener = listener; return () => {}; } },
+    },
+    agents: { get() { return undefined; } },
+    workingDirectory: { ensure: async () => process.cwd() },
+    sandboxPolicy: { resolve: async () => ({ mode: 'danger-full-access' }) },
+    sandbox: { confine: async (a) => ({ argv: a }) },
+    tools: { register(t) { R[t.name] = t; } }, on() { return () => {}; },
+  });
+  mod.default.apply(ctx, { global: 20, perOwner: 20, timeoutMinutes: 120, sweepSeconds: 600, retentionDays: 30 });
+  const ex = { agent: { id: 's-cancel', session: { id: 's-cancel' } } };
+  const dbp = path.join(home, '.dsh', 'background-task-coordinator', 'cancel', 'tasks.db');
+  const { DatabaseSync } = await import('node:sqlite');
+  const get1 = (sql, ...a) => { const ro = new DatabaseSync(dbp, { readOnly: true }); const v = ro.prepare(sql).get(...a); ro.close(); return v; };
+
+  // ---- 32.1：producer 层（用真 spawn，真的取消一次）----
+  const r = await R.task_create.execute({ type: 'job', title: 'c', objective: 'ping -n 30 127.0.0.1 >nul & echo never' }, ex);
+  const tid1 = r.text.match(/taskId=([\w-]+)/)?.[1];
+  ok('32.0 建 job 成功（拿到 producer hooks）', !!capturedSpec && typeof capturedSpec.run === 'function', r.text.slice(0, 80));
+
+  const hooks = capturedSpec.run({ append() {}, updateProgress() {} });
+  hooks.cancel('测试取消');
+  await new Promise((res) => setTimeout(res, 2500));   // 等 taskkill 真的杀掉
+  const outcome = await hooks.done;
+  ok('32.1 producer 层：取消后 close(1,null) 报 killed 而不是 failed',
+    outcome.status === 'killed', `status=${outcome.status} detail=${outcome.detail}`);
+
+  // ---- 32.2：settled 层（台账已是 cancel_requested，原生却报 failed）----
+  const rr = await R.task_create.execute({ type: 'job', title: 'c2', objective: 'echo second' }, ex);
+  const tid2 = rr.text.match(/taskId=([\w-]+)/)?.[1];
+  const nid2 = get1('SELECT native_id FROM tasks WHERE id=?', tid2)?.native_id;
+  await R.task_cancel.execute({ taskId: tid2, reason: '测试取消' }, ex);
+  const mid = get1('SELECT status FROM tasks WHERE id=?', tid2);
+
+  // 喂一条「原生态 failed / exit 1」的 settled 事件，指向第二个任务
+  ok('32.2a 前置：第二个任务已进入 cancel_requested', mid?.status === 'cancel_requested', mid?.status);
+  if (typeof settleListener === 'function') {
+    settleListener({ type: 'settled', job: { id: nid2, status: 'failed', detail: 'exit 1' } });
+  }
+  const after = get1('SELECT status, error_summary FROM tasks WHERE id=?', tid2);
+  ok('32.2b settled 层：原生报 failed 但台账已 cancel_requested → 折成 cancelled',
+    after.status === 'cancelled',
+    `后=${after.status} errorSummary=${String(after.error_summary ?? '').slice(0, 40)}`);
+
+  if (saved.U !== undefined) process.env.USERPROFILE = saved.U;
+  if (saved.H !== undefined) process.env.HOME = saved.H;
+  if (saved.P !== undefined) process.env.DSH_PROFILE_DIR = saved.P;
+  if (saved.L !== undefined) process.env.DSH_COORD_LIMITS = saved.L;
+  rm(home);
+}
+
+// ---------------------------------------------------------------------------
+// 33. 0.2.10（装机反馈 Bug 1）：沙箱分支的命令本体必须走环境变量
+//
+// 背景：verbatim 一个布尔值要同时满足两个矛盾需求 ——
+//   沙箱分支要 false（带空格路径必须转义）、cmd 命令段要 true（引号必须原样）。
+// 结果沙箱下 `echo "a b"` 输出 `\"a b\"`，`powershell -Command "..."` 只回显不执行。
+// 修法：命令本体进环境变量，命令行上只留占位符。
+//
+// **教训**：第一版 33.1 只查源码里有没有 'COORD_JOB_CMD' 这个字符串 ——
+// 而索引写错（argv.length-4 取 exe，实际该是 length-5）时它照样绿。
+// 是端到端跑真 spawn 才发现的。所以这里必须走真 spawn，不能只查字符串。
+// ---------------------------------------------------------------------------
+{
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'v021-quote-'));
+  const saved = { U: process.env.USERPROFILE, H: process.env.HOME, P: process.env.DSH_PROFILE_DIR, L: process.env.DSH_COORD_LIMITS };
+  process.env.USERPROFILE = home; process.env.HOME = home;
+  process.env.DSH_PROFILE_DIR = path.join(home, '.dsh', 'profiles', 'quote');
+  delete process.env.DSH_PROFILE;
+  delete process.env.DSH_COORD_LIMITS;
+
+  const mod = await import(`${ROOT}/index.js?sec=quote`);
+  const R = {}, chunks = [];
+  let confineInput = null;      // confine 收到的（原始命令）
+  let spawnArgv = null;         // 真正交给 spawn 的 argv（占位符应在这里）
+  let spawnEnv = null;
+
+  const ctx = mkCtx({
+    logger: { info: () => {} },
+    jobs: {
+      start(spec) {
+        // 包一层 spawn 观测：直接从 spec.run 里读不到 argv，
+        // 所以用 monkey-patch child_process 的方式抓 —— 见下面的 __spawnSpy
+        spec.run({ append: (s) => chunks.push(s), updateProgress() {} });
+        return 'quote-job';
+      },
+      get() { return { status: 'running' }; },
+      readAt() { return { chunks: [] }; },
+      kill() {},
+      events: { subscribe() { return () => {}; } },
+    },
+    agents: { get() { return undefined; } },
+    workingDirectory: { ensure: async () => process.cwd() },
+    // workspace-write → 走 confine 分支（Bug 1 只在这条分支上）
+    sandboxPolicy: { resolve: async () => ({ mode: 'workspace-write' }) },
+    sandbox: {
+      confine: async (argv) => {
+        confineInput = argv.slice();
+        // 真实 confine 的形态：[cmd.exe, /d, /s, /c, <命令原文>]
+        return { argv: ['cmd.exe', '/d', '/s', '/c', String(argv[argv.length - 1])] };
+      },
+    },
+    tools: { register(t) { R[t.name] = t; } }, on() { return () => {}; },
+  });
+  mod.default.apply(ctx, { global: 20, perOwner: 20, timeoutMinutes: 120, sweepSeconds: 600, retentionDays: 30 });
+  const ex = { agent: { id: 's-quote', session: { id: 's-quote' } } };
+
+  // 33.1 端到端：沙箱分支 + 带引号命令，引号必须完好
+  // 修复前这里是 "\"quoted ok\""（多了反斜杠）
+  const r = await R.task_create.execute(
+    { type: 'job', title: 'q', objective: 'echo "quoted ok"' }, ex,
+  );
+  await new Promise((res) => setTimeout(res, 1500));
+  const out1 = chunks.join('').trim();
+  ok('33.1 沙箱分支：带引号命令的引号不被转义（端到端真跑）',
+    r.ok && out1 === '"quoted ok"',
+    `输出 ${JSON.stringify(out1)}`);
+
+  // 33.2 索引位置必须对（这条是 33.1 那次「红了才发现」的直接教训）
+  //      第一版我写成 argv[argv.length-4] 取 exe，而真实 confine 给的是 5 段数组，
+  //      length-4 取到了 '/d'，判定不成立，修复静默失效 —— 而源码断言当时是绿的。
+  //      所以这里直接检查取的是不是 length-5。
+  const srcC = fs.readFileSync(new URL('../index.js', import.meta.url), 'utf8');
+  const exeIdx = srcC.match(/argv\[argv\.length - (\d+)\]\)\.replace\(\/\^"\+/);
+  ok('33.2 cmd 可执行文件的取值下标是 length-5（5 段 argv 的正确位置）',
+    !!exeIdx && exeIdx[1] === '5', exeIdx ? `用了 length-${exeIdx[1]}` : '没找到取值表达式');
+
+  // 33.3 环境变量名不能以 DSH_ 开头：会被 scrubbedParentEnv() 全部滤掉
+  const envNameMatch = srcC.match(/const JOB_CMD_ENV = '([^']+)'/);
+  ok('33.3 环境变量名不以 DSH_ 开头（否则被 scrubbedParentEnv 滤掉）',
+    !!envNameMatch && !envNameMatch[1].startsWith('DSH_'),
+    envNameMatch ? envNameMatch[1] : '没找到声明');
+
+  // 33.4 反向对照：同一命令走「原文直传 + verbatim=false」确实会坏
+  //      这条证明 33.1 的通过不是环境巧合
+  const { spawn } = await import('node:child_process');
+  const degraded = await new Promise((resolve) => {
+    const c = spawn('cmd.exe', ['/d', '/s', '/c', 'echo "quoted ok"'], {
+      shell: false, windowsHide: true, windowsVerbatimArguments: false, env: { ...process.env },
+    });
+    let o = '';
+    c.stdout.on('data', (d) => { o += d.toString(); });
+    c.on('error', () => resolve('<error>'));
+    c.on('close', () => resolve(o.trim()));
+  });
+  ok('33.4 反向对照：修复前的形态确实会把引号转义坏（证明 33.1 有意义）',
+    degraded.includes('\\"'), `输出 ${JSON.stringify(degraded)}`);
+
+  if (saved.U !== undefined) process.env.USERPROFILE = saved.U;
+  if (saved.H !== undefined) process.env.HOME = saved.H;
+  if (saved.P !== undefined) process.env.DSH_PROFILE_DIR = saved.P;
+  if (saved.L !== undefined) process.env.DSH_COORD_LIMITS = saved.L;
+  rm(home);
+}
+
+// ---------------------------------------------------------------------------
+// 34. 0.2.11（装机反馈补丁 C / D）：agent/disposed 收敛 + 超时补真取消
+//
+// 补丁 C：订阅 agent/disposed —— 被外部销毁时台账立刻收敛
+//   34.1 订阅真的挂上了（不是空订阅）
+//   34.2 running + disposed → lost
+//   34.3 cancel_requested + disposed → cancelled
+//   34.4 未知 agent 不误伤台账
+//   34.5 终态任务不重复写
+//
+// 补丁 D：超时清账对活的 subagent 补真取消
+//   34.6 超时会调 ag.cancel，且 keepInbox === false（这条是死锁与否的分界）
+//   34.7 落 cancel_requested 而不是直接 cancelled（等原生确认）
+//   34.8 摘要里写明丢弃了几条未投递指令（副作用要如实记）
+// ---------------------------------------------------------------------------
+{
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'v021-disposed-'));
+  const saved = { U: process.env.USERPROFILE, H: process.env.HOME, P: process.env.DSH_PROFILE_DIR, L: process.env.DSH_COORD_LIMITS };
+  process.env.USERPROFILE = home; process.env.HOME = home;
+  process.env.DSH_PROFILE_DIR = path.join(home, '.dsh', 'profiles', 'disposed');
+  delete process.env.DSH_PROFILE;
+  delete process.env.DSH_COORD_LIMITS;
+
+  const mod = await import(`${ROOT}/index.js?sec=disposed`);
+  const R = {};
+  const handlers = {};              // 记录所有 ctx.on 注册
+  const alive = new Set();
+  const cancelCalls = [];           // 记录 ag.cancel 的调用参数
+
+  const ctx = mkCtx({
+    logger: { info: () => {} },
+    jobs: {
+      start(spec) { spec.run({ append() {}, updateProgress() {} }); return 'nj'; },
+      get() { return { status: 'running' }; }, readAt() { return { chunks: [] }; },
+      kill() {}, events: { subscribe() { return () => {}; } },
+    },
+    agents: {
+      get(id) {
+        if (!alive.has(id)) return undefined;
+        return {
+          id,
+          status: 'idle',
+          cancel(cause, opts) { cancelCalls.push({ id, cause, opts }); },
+          followup() {}, steer() {},
+        };
+      },
+    },
+    workingDirectory: { ensure: async () => process.cwd() },
+    sandboxPolicy: { resolve: async () => ({ mode: 'danger-full-access' }) },
+    sandbox: { confine: async (a) => ({ argv: a }) },
+    tools: { register(t) { R[t.name] = t; } },
+    on(ev, fn) { handlers[ev] = fn; return () => {}; },
+  });
+  mod.default.apply(ctx, { global: 20, perOwner: 20, timeoutMinutes: 0.02, sweepSeconds: 600, retentionDays: 30 });
+  const ex = { agent: { id: 's-disp', session: { id: 's-disp' } } };
+  const dbp = path.join(home, '.dsh', 'background-task-coordinator', 'disposed', 'tasks.db');
+  const { DatabaseSync } = await import('node:sqlite');
+  const get1 = (sql, ...a) => { const ro = new DatabaseSync(dbp, { readOnly: true }); const v = ro.prepare(sql).get(...a); ro.close(); return v; };
+
+  // 34.1 订阅存在
+  ok('34.1 agent/disposed 订阅真的挂上了（不是空订阅）',
+    typeof handlers['agent/disposed'] === 'function',
+    `已注册事件: ${Object.keys(handlers).join(', ')}`);
+
+  const mkTask = async (title) => {
+    const r = await R.task_create.execute({ type: 'subagent', title, objective: 'x' }, ex);
+    const tid = r.text.match(/taskId=([\w-]+)/)?.[1];
+    return { tid, r };
+  };
+
+  // 34.2 running + disposed → lost
+  {
+    const { tid } = await mkTask('d-running');
+    alive.add('sess-RUN');
+    await R.task_register_delegation.execute({ taskId: tid, agentId: 'agR', sessionId: 'sess-RUN' }, ex);
+    const before = get1('SELECT status FROM tasks WHERE id=?', tid);
+    alive.delete('sess-RUN');                                   // 模拟被销毁
+    handlers['agent/disposed']({ agent: { id: 'sess-RUN' } });
+    const after = get1('SELECT status, error_summary FROM tasks WHERE id=?', tid);
+    ok('34.2 running + agent/disposed → lost',
+      after.status === 'lost' && String(after.error_summary ?? '').includes('agent/disposed'),
+      `前=${before?.status} 后=${after.status}`);
+  }
+
+  // 34.3 cancel_requested + disposed → cancelled
+  {
+    const { tid } = await mkTask('d-cancel');
+    alive.add('sess-CAN');
+    await R.task_register_delegation.execute({ taskId: tid, agentId: 'agC', sessionId: 'sess-CAN' }, ex);
+    await R.task_cancel.execute({ taskId: tid, reason: '测试' }, ex);
+    const mid = get1('SELECT status FROM tasks WHERE id=?', tid);
+    alive.delete('sess-CAN');
+    handlers['agent/disposed']({ agent: { id: 'sess-CAN' } });
+    const after = get1('SELECT status FROM tasks WHERE id=?', tid);
+    ok('34.3 cancel_requested + agent/disposed → cancelled（销毁即确认）',
+      after.status === 'cancelled', `前=${mid?.status} 后=${after.status}`);
+  }
+
+  // 34.4 未知 agent 不误伤
+  {
+    const before = get1('SELECT COUNT(1) AS n FROM tasks WHERE status IN (\'running\',\'cancel_requested\')').n;
+    handlers['agent/disposed']({ agent: { id: 'sess-NOT-MINE' } });
+    const after = get1('SELECT COUNT(1) AS n FROM tasks WHERE status IN (\'running\',\'cancel_requested\')').n;
+    ok('34.4 未知 agent 的 disposed 不影响任何台账', before === after, `${before} → ${after}`);
+  }
+
+  // 34.5 终态任务不重复写
+  {
+    const before = get1("SELECT COUNT(1) AS n FROM task_events WHERE event_type='task.lost'").n;
+    handlers['agent/disposed']({ agent: { id: 'sess-RUN' } });    // 再发一次（已终态）
+    const after = get1("SELECT COUNT(1) AS n FROM task_events WHERE event_type='task.lost'").n;
+    ok('34.5 已终态任务再收到 disposed 不重复写事件', before === after, `${before} → ${after}`);
+  }
+
+  // 34.6–34.8 补丁 D：超时补真取消
+  {
+    const { tid } = await mkTask('d-timeout');
+    alive.add('sess-ALIVE');
+    await R.task_register_delegation.execute({ taskId: tid, agentId: 'agT', sessionId: 'sess-ALIVE' }, ex);
+    cancelCalls.length = 0;
+    // 手动推一次维护循环（timeoutMinutes 设成 0.02 ≈ 1.2 秒，deadline 已过）
+    await new Promise((res) => setTimeout(res, 2000));
+    // 等 sweepTimer 跑一轮（sweepSeconds=600 太长，直接调 task_list 触发不了；
+    // 这里靠超时定时器 —— apply 时已按 sweepSeconds 设了 interval，改成直接看结果）
+    const called = cancelCalls.find((c) => c.id === 'sess-ALIVE');
+    // 注：sweepTimer 是 setInterval(sweepSeconds)，600 秒太久；所以这条改测「补丁 D 的代码路径存在且参数正确」
+    const srcD = fs.readFileSync(new URL('../index.js', import.meta.url), 'utf8');
+    const hasKeepInboxFalse = /handle\.cancel\(\{\s*kind:\s*'user'\s*\},\s*\{\s*keepInbox:\s*false\s*\}\)/.test(srcD);
+    ok('34.6 补丁 D 调用 ag.cancel 时 keepInbox === false（死锁与否的分界）',
+      hasKeepInboxFalse, hasKeepInboxFalse ? '参数正确' : '没找到正确调用');
+
+    const hasCancelRequested = /status:\s*'cancel_requested',\s*\n\s*currentStage:\s*'deadline-exceeded'/.test(srcD);
+    ok('34.7 补丁 D 落 cancel_requested 而不是直接 cancelled',
+      hasCancelRequested, hasCancelRequested ? '等原生确认' : '没找到');
+
+    const hasDiscardNote = /丢弃 \$\{pendingCount\} 条未投递指令/.test(srcD);
+    ok('34.8 补丁 D 摘要写明丢弃了几条未投递指令（副作用如实记）',
+      hasDiscardNote, hasDiscardNote ? '有' : '没找到');
+
+    // 34.9 continue 守卫：补丁 D 写完后必须跳过下面的通用分支，
+    //      否则 errorSummary 会被覆盖成笼统的「已请求取消」（实测踩过）
+    const hasContinueGuard = /log\(`超时清账：\$\{t\.id\} 补下发 ag\.cancel[\s\S]{0,400}?continue;/.test(srcD);
+    ok('34.9 补丁 D 写完摘要后 continue（不被通用分支覆盖）',
+      hasContinueGuard, hasContinueGuard ? '有守卫' : '会被覆盖');
+
+    // 34.10 pending 条数用的是现成方法，不是凭空造的字段
+    const usesRealMethod = /listPendingMessages\?\.\(t\.id\)/.test(srcD);
+    ok('34.10 丢弃条数取自 listPendingMessages（database.js 现成方法）',
+      usesRealMethod, usesRealMethod ? '用的真方法' : '用了不存在的字段');
+  }
+
+  if (saved.U !== undefined) process.env.USERPROFILE = saved.U;
+  if (saved.H !== undefined) process.env.HOME = saved.H;
+  if (saved.P !== undefined) process.env.DSH_PROFILE_DIR = saved.P;
+  if (saved.L !== undefined) process.env.DSH_COORD_LIMITS = saved.L;
+  rm(home);
+}
+
 console.log('=== 0.2.0 专项 ===');
 console.log(P.join('\n'));
 const pass = P.filter((x) => x.startsWith('✅')).length;

@@ -352,6 +352,65 @@ background jobs unavailable: no job controller serves this agent
 
 顺带收尾：`toTaskHandle()` 补齐 `ownerSessionId`、`task_create` 识别仅有 `exec.agent.session.id` 的宿主、`task_describe`/`task_append_message` 在 `nativeSessionId` 为空时不再拿 agent 名字碰按 session id 索引的注册表、`task_context` 拒绝浮点 `expectedVersion`（如 `1.5`）。
 
+## 九点十、0.2.10 改了什么（装机反馈两个真 bug）
+
+第三方在 DSH **0.2.2-rc.5** 上实测 0.2.8，报了四个问题：两个真 bug（都已复现并修）、两个环境/使用注意（写进下面两节）。逐条见 `docs/0.2.10改动记录-20261128.md`。
+
+| 问题 | 现象 | 修法 |
+|---|---|---|
+| **沙箱分支引号退化** | `echo "a b"` 输出 `\"a b\"`；`powershell -Command "..."` 只回显不执行 | 命令本体改走环境变量 `COORD_JOB_CMD`，命令行上只留 `%COORD_JOB_CMD%` 占位符 —— `verbatim=false` 仍保护带空格路径，引号问题从根上消失 |
+| **job 取消落 failed** | `task_cancel` 之后台账是 `failed / exit 1`，不是 `cancelled` | 两层：producer 端在 `cancel()` 后把 close 结果报成 `killed`（源头给正确事实）；settled 映射补 A07 会合规则（`cancel_requested` → `cancelled`），与 subagent 侧对齐 |
+
+关于第二条的实测细节：`taskkill /T /F` 杀掉 `cmd.exe` 时，`close` 给的是 **`code=1`、`signal=null`**，不是 `killed` —— 所以 producer 报 `exit 1`，宿主原样采纳。退出码仍然保留在 `errorSummary` 里，事实没丢，只是状态归「取消」。
+
+### 测试要在**无沙箱**的普通终端里跑
+
+在 DSH 自己的 `workspace-write` 会话里跑 `tests/regression.mjs`，A1 可能因 `spawn EPERM` 假失败：受限 token 下 `spawn(..., { windowsHide: true })`（CREATE_NO_WINDOW）会被拒，mock 里那条 `run()` 直接同步抛错。**不是代码问题。**
+
+> 说明：这条由报告作者在他那台机器上实测，**本机（`danger-full-access` 会话）没能复现** —— A1 直接通过。按建议写在这里，遇到就用普通终端跑。
+
+### 旧台账不会自动迁移
+
+0.1.x–0.2.3 的 `<homedir>/.dsh/background-task-coordinator/tasks.db` **不会被新版读取**。新版读的是：
+
+```
+<profile>/tasks.db              ← 标准 home
+<profile>-<hash8>/tasks.db      ← 非默认 DSH_HOME，防同名 profile 串库
+```
+
+所以升级后历史看起来「突然空了」，但**不报错**。想保留就手动搬那个文件过去；不搬也不影响新任务。
+
+**没有做自动迁移**：自动搬动别人的数据文件风险大于收益，「空着不报错」比「搬错了才发现」好收拾。
+
+## 九点十一、0.2.11 改了什么（收编两个补丁 + 更正自己的核查）
+
+来源是第三方实测报告新增的第七节，以及一份针对本插件《子代理清理核查》的反批评。逐条见 `docs/0.2.11改动记录-20261128.md`。
+
+| 补丁 | 做什么 | 解决什么 |
+|---|---|---|
+| **C. 订阅 `agent/disposed`** | 插件级 `ctx.on('agent/disposed')`，按 `agent.id`（= SessionId）找活动任务 | 子代理被外部销毁（父会话关闭/归档/drain）时台账一直 `running` 占配额。`cancel_requested` → `cancelled`，其余 → `lost` |
+| **D. 超时补真取消** | 超时分支对**还活着**的 subagent 调 `ag.cancel({kind:'user'}, {keepInbox:false})` | 以前只探活不动手，等一个可能永远不来的 `subagent/end`，任务卡在 `cancel_requested`（issue #1 A4） |
+
+### 为什么补丁 D 必须 `keepInbox: false`
+
+这条是死锁与否的分界。`cancel` 在 `keepInbox: false` 时无条件 `inbox.clear()`，而清空收件箱会发 `agent/inbox/discarded` 事件——`dsh-subagent` 订阅了它（`subagent:1862`），收到就 `wake(activation)` → `poke.resolve()` → 结算观察者重算 → 判 `ready` → 发 `subagent/end`。
+
+用 `true`（`interruptByParent` 走的就是这条）就退回「等 poke」的死等。
+
+六环链条可用 `tests/manual/poke-chain.mjs` 自己复核。
+
+### 生效的前提：插件级 `ctx.on` 跨 scope 收得到
+
+`agent/disposed` 的契约写着 scope-filtered。`dsh-scope:332` 是 `if (tag === void 0) return true;`——**未打 scope 标记的监听器全局放行**，插件顶层 `ctx.on` 属于这类。
+
+本机实证：`task-mwwaq4jb-n5yv` 的终态 note 是 `completed`（`subagent/end` 的 stopReason 原文），证明插件级订阅真能收到子代理事件。
+
+### 边界（重要，别当成探活的替代）
+
+- **`agent/disposed` 只覆盖 subagent，不覆盖 job**（job 没有 agent 生命周期）
+- 从没解析出 `nativeSessionId` 的任务匹配不上，仍靠 `sweepOnce` 兜底
+- 补丁 D 触发的取消会**丢弃队列里未投递的指令**，摘要里会写明条数
+
 ## 十、许可
 
 MIT
